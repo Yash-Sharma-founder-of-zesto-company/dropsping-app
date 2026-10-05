@@ -1,0 +1,1866 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Zesto</title>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Poppins:wght@600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css" crossorigin="anonymous" referrerpolicy="no-referrer"/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+/* Zesto Supabase compatibility layer — replaces Firebase Realtime Database API used by this app. */
+const SUPABASE_URL='https://ddzifeqexzazcywljgcp.supabase.co';
+const SUPABASE_PUBLISHABLE_KEY='sb_publishable_dU4r16MPsAevLqvTXXMmTQ_kMQQoohj';
+const sb=window.supabase.createClient(SUPABASE_URL,SUPABASE_PUBLISHABLE_KEY,{auth:{persistSession:false}});
+class ZSnapshot{constructor(v){this._v=v} val(){return this._v} exists(){return this._v!==null && this._v!==undefined}}
+const zClone=v=>v==null?v:JSON.parse(JSON.stringify(v));
+const zKey=()=> 'k_'+Date.now().toString(36)+'_'+crypto.getRandomValues(new Uint32Array(1))[0].toString(36);
+class ZRef{
+ constructor(path,filter=null){this.path=String(path||'').replace(/^\/+|\/+$/g,'');this.filter=filter;this._subs=[]}
+ child(p){return new ZRef(this.path+'/'+p,this.filter)}
+ push(){return {key:zKey()}}
+ orderByChild(field){return new ZRef(this.path,{field,value:undefined})}
+ equalTo(value){return new ZRef(this.path,this.filter?{...this.filter,value}:null)}
+ _parts(){const a=this.path.split('/').filter(Boolean);return {root:a[0]||'',key:a[1]||'__root__',nested:a.slice(2)}}
+ async _row(root,key){const {data,error}=await sb.from('zesto_data').select('data,version').eq('root',root).eq('item_key',key).maybeSingle();if(error)throw error;return data}
+ async _read(){const {root,key,nested}=this._parts();if(!root)return null;
+   if(this.path.split('/').filter(Boolean).length===1){const {data,error}=await sb.from('zesto_data').select('item_key,data').eq('root',root);if(error)throw error;let out={};for(const r of data||[]){if(r.item_key==='__root__'&&r.data&&typeof r.data==='object')out={...out,...r.data};else out[r.item_key]=r.data}if(this.filter){out=Object.fromEntries(Object.entries(out).filter(([,v])=>v&&v[this.filter.field]===this.filter.value))}return out}
+   const row=await this._row(root,key);let v=row?.data??null;for(const n of nested)v=v?.[n]??null;return v}
+ async once(){return new ZSnapshot(await this._read())}
+ async set(value){const {root,key,nested}=this._parts();if(!nested.length){const {error}=await sb.from('zesto_data').upsert({root,item_key:key,data:zClone(value),updated_at:new Date().toISOString()},{onConflict:'root,item_key'});if(error)throw error;return}
+   const row=await this._row(root,key);let base=zClone(row?.data)||{};let cur=base;for(let i=0;i<nested.length-1;i++)cur=cur[nested[i]]??=( {} );cur[nested.at(-1)]=zClone(value);return new ZRef(root+'/'+key).set(base)}
+ async update(patch){const current=(await this._read())||{};return this.set({...current,...zClone(patch)})}
+ async remove(){const {root,key,nested}=this._parts();if(nested.length){const row=await this._row(root,key);let base=zClone(row?.data)||{},cur=base;for(let i=0;i<nested.length-1;i++){if(!cur[nested[i]])return;cur=cur[nested[i]]}delete cur[nested.at(-1)];return new ZRef(root+'/'+key).set(base)}const {error}=await sb.from('zesto_data').delete().eq('root',root).eq('item_key',key);if(error)throw error}
+ on(event,cb){
+  if(event!=='value')return;
+  let stopped=false,busy=false,lastJson=null;
+  const fire=async(force=false)=>{
+    if(stopped||busy)return;
+    busy=true;
+    try{
+      const value=await this._read();
+      const json=JSON.stringify(value);
+      if(force||json!==lastJson){lastJson=json;cb(new ZSnapshot(value))}
+    }catch(e){console.error('Supabase realtime sync:',e)}finally{busy=false}
+  };
+  const {root}=this._parts();
+  fire(true);
+  const ch=sb.channel('zesto_'+root+'_'+Math.random().toString(36).slice(2))
+    .on('postgres_changes',{event:'*',schema:'public',table:'zesto_data',filter:'root=eq.'+root},()=>fire())
+    .subscribe(status=>{if(status==='SUBSCRIBED')fire()});
+  // Safety net for Android/WebView/background reconnects: realtime stays primary,
+  // while this lightweight check prevents a missed socket event from requiring manual refresh.
+  const timer=setInterval(()=>fire(),2000);
+  const wake=()=>fire(true);
+  const visible=()=>{if(document.visibilityState==='visible')fire(true)};
+  window.addEventListener('online',wake);
+  window.addEventListener('focus',wake);
+  document.addEventListener('visibilitychange',visible);
+  this._subs.push({ch,stop:()=>{
+    stopped=true;clearInterval(timer);
+    window.removeEventListener('online',wake);
+    window.removeEventListener('focus',wake);
+    document.removeEventListener('visibilitychange',visible);
+  }});
+  return cb
+ }
+ off(){for(const s of this._subs){s.stop();sb.removeChannel(s.ch)}this._subs=[]}
+ async transaction(fn){const {root,key,nested}=this._parts();if(nested.length)throw new Error('Nested transaction not supported');for(let i=0;i<5;i++){const row=await this._row(root,key);const old=row?.data??null,ver=row?.version??0;const next=fn(zClone(old));if(next===undefined)return {committed:false,snapshot:new ZSnapshot(old)};const {data,error}=await sb.rpc('zesto_cas',{p_root:root,p_key:key,p_expected_version:ver,p_data:zClone(next)});if(error)throw error;if(data===true)return {committed:true,snapshot:new ZSnapshot(next)}}return {committed:false,snapshot:new ZSnapshot(await this._read())}}
+}
+const db={ref:path=>new ZRef(path)};
+</script>
+
+<style>
+:root{
+  --primary:#CC5500;--bg:#F8F4E7;--surface:#FFFDF7;--line:#E4D6C8;--muted:#6D5B53;
+  --accent:#CC5500;--accentText:#FFFFFF;--success:#CC5500;--radius:16px;
+  --shadow:0 1px 2px rgba(10,10,10,.06),0 8px 24px rgba(10,10,10,.05);
+  --shadow-sm:0 1px 3px rgba(10,10,10,.08);
+  --safe:env(safe-area-inset-bottom,0px);--container:740px;
+  --accentLight:#F8F4E7;--accentDark:#4E342E;
+}
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:var(--bg);color:#111;font-family:Inter,system-ui,-apple-system,"Segoe UI",Arial,sans-serif;line-height:1.35}
+img{max-width:100%;display:block}
+button{font:inherit;cursor:pointer}
+a{color:inherit;text-decoration:none}
+#app{min-height:100dvh;display:flex;flex-direction:column}
+.wrap{max-width:var(--container);margin:0 auto}
+.topbar{position:sticky;top:0;z-index:20;background:#F8F4E7;backdrop-filter:saturate(120%) blur(6px);border-bottom:1px solid var(--line)}
+.topbar-inner{height:56px;display:flex;align-items:center;gap:10px;padding:0 16px}
+.topbar-logo{height:36px;width:auto;border-radius:8px;flex-shrink:0}
+.title{font-family:Poppins,sans-serif;font-size:20px;font-weight:700;margin:0;color:var(--accentDark)}
+.icon-round{width:36px;height:36px;border-radius:999px;border:1px solid var(--line);background:#fff;display:inline-grid;place-items:center;color:#111;box-shadow:var(--shadow-sm)}
+.tabbar{position:fixed;left:0;right:0;bottom:0;z-index:30;background:rgba(255,255,255,.95);border-top:1px solid var(--line);backdrop-filter:saturate(120%) blur(6px);padding-bottom:var(--safe)}
+.tabbar-inner{max-width:var(--container);margin:0 auto;display:grid;grid-template-columns:repeat(5,1fr);gap:2px;padding:8px 8px calc(10px + var(--safe))}
+.tabbar-inner.four-tabs{grid-template-columns:repeat(4,1fr)}
+.tab{display:flex;flex-direction:column;align-items:center;gap:4px;color:#9CA3AF;padding:6px 4px;border-radius:10px;font-size:11px;transition:color .2s}
+.tab.active{color:var(--accent);background:var(--accentLight)}
+.tab span{font-size:11px}
+.tab i{font-size:18px}
+.loader{text-align:center;padding:30px;color:var(--muted)}
+.loader .dot{display:inline-block;width:8px;height:8px;background:var(--accent);border-radius:999px;margin:0 2px;animation:bounce 1.4s infinite ease-in-out both}
+.loader .dot:nth-child(1){animation-delay:-.32s}
+.loader .dot:nth-child(2){animation-delay:-.16s}
+@keyframes bounce{0%,80%,100%{transform:scale(0)}40%{transform:scale(1)}}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow)}
+.card.pad{padding:16px}
+.muted{color:var(--muted)}
+.chip{display:inline-flex;align-items:center;gap:6px;padding:8px 12px;border-radius:999px;border:1px solid var(--line);background:#fff;font-size:14px}
+input,textarea,select{width:100%;padding:14px;border:1px solid var(--line);border-radius:14px;background:#fff;font:inherit}
+input:focus,textarea:focus,select:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(204,85,0,.15)}
+textarea{min-height:92px;resize:vertical}
+label{font-size:13px;color:#111;margin:10px 0 6px;display:block}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:10px;font-weight:700;border:none;border-radius:14px;padding:14px 16px;background:var(--accent);color:var(--accentText);transition:background .2s}
+.btn:hover{background:var(--accentDark)}
+.btn:active{transform:translateY(1px)}
+.btn:disabled{background:#ccc;color:#666;cursor:not-allowed;transform:none}
+.btn-outline{background:#fff;color:#111;border:1px solid var(--line)}
+.btn-outline:hover{background:var(--accentLight);border-color:var(--accent)}
+.btn-block{width:100%}
+.btn-sm{padding:8px 12px;font-size:13px;border-radius:10px}
+.btn-success{background:var(--success);color:#fff;border:none}
+.btn-danger{background:#E11D48;color:#fff;border:none}
+.star-rating{color:#FFD700;font-size:18px;margin-left:auto}
+.rate-stars .fa-star{cursor:pointer;transition:color .2s}
+.rate-stars .active{color:#FFD700}
+.size-btn{display:inline-flex;align-items:center;justify-content:center;height:56px;min-width:56px;padding:0 12px;border-radius:12px;border:1px solid var(--line);background:var(--surface);font-weight:600;box-shadow:var(--shadow-sm);transition:all .2s}
+.size-btn.active,.size-btn:active{transform:translateY(1px);box-shadow:0 1px 2px rgba(10,10,10,.06);background:var(--accentLight);border:2px solid var(--accent);color:var(--accentDark)}
+.price-line{display:flex;align-items:center;gap:8px}
+.strike{color:#9CA3AF;text-decoration:line-through}
+.badge-off{background:var(--accent);color:var(--accentText);border-radius:999px;font-size:12px;padding:4px 8px}
+.filters{display:flex;gap:10px;overflow:auto;padding:8px 0}
+.filters .chip.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+.grid{display:grid;gap:14px;grid-template-columns:1fr 1fr}
+@media(min-width:680px){.grid{grid-template-columns:repeat(3,1fr)}}
+.p-card{overflow:hidden;position:relative;transition:transform .2s}
+.p-card:hover{transform:translateY(-2px)}
+.p-img{border-bottom:1px solid var(--line);position:relative;width:100%;aspect-ratio:1/1}
+.p-img img{width:100%;height:100%;object-fit:cover}
+.p-meta{padding:12px}
+.p-title{font-weight:600}
+.discount-badge{position:absolute;top:10px;right:10px;background:var(--accent);color:var(--accentText);border-radius:999px;font-size:12px;padding:6px 10px}
+.hero-img{margin:12px;border-radius:18px;overflow:hidden;max-height:450px;display:flex}
+.hero-img img{width:100%;aspect-ratio:1/1.6;object-fit:cover;object-position:center top}
+.cart-list{display:flex;flex-direction:column;gap:12px}
+.cart-item{display:grid;grid-template-columns:76px 1fr auto;gap:12px;align-items:center;padding:10px;border-radius:14px;border:1px solid var(--line);background:#fff}
+.cart-item img{width:76px;height:76px;object-fit:cover;border-radius:12px;border:1px solid var(--line)}
+.qty{display:flex;align-items:center;gap:10px;margin-top:8px}
+.circle-btn{width:36px;height:36px;border-radius:999px;border:1px solid var(--line);display:grid;place-items:center;background:#F3F4F6;color:#111}
+.circle-btn.primary{background:var(--accent);color:var(--accentText);border-color:var(--accent)}
+.sticky-sheet{position:sticky;bottom:0;background:rgba(255,255,255,.94);backdrop-filter:saturate(120%) blur(6px);border-top:1px solid var(--line);padding:12px;border-bottom-left-radius:12px;border-bottom-right-radius:12px}
+.row{display:flex;align-items:center;justify-content:space-between}
+.sep{height:1px;background:var(--line);margin:10px 0}
+.success-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;padding:30px 14px}
+.check-anim{width:92px;height:92px;border-radius:999px;background:#E9FAF1;border:2px solid #CFF7DF;display:grid;place-items:center;color:#18A957;animation:pop .35s ease-out forwards,glow 1.2s ease-in-out 0.3s infinite alternate}
+@keyframes pop{from{transform:scale(.7);opacity:.2}to{transform:scale(1);opacity:1}}
+@keyframes glow{from{box-shadow:0 0 0 rgba(124,191,92,0)}to{box-shadow:0 0 18px rgba(124,191,92,.35)}}
+.confetti{position:relative;width:100%;height:0;overflow:visible}
+.confetti span{position:absolute;width:8px;height:14px;border-radius:2px;animation:fall 1.2s linear forwards}
+@keyframes fall{to{transform:translateY(220px) rotate(360deg);opacity:.2}}
+.toast{position:fixed;left:50%;bottom:calc(84px + var(--safe));transform:translateX(-50%);background:var(--accentDark);color:#fff;padding:10px 14px;border-radius:999px;font-size:14px;opacity:0;pointer-events:none;transition:opacity .2s;z-index:60}
+.toast.show{opacity:1}
+.animated-banner-wrap{background:linear-gradient(135deg,var(--accent) 0%,var(--accentDark) 100%);color:var(--accentText);overflow:hidden;white-space:nowrap;position:relative;height:36px;line-height:36px;text-align:center;font-size:14px;font-weight:600}
+.animated-banner-text{display:inline-block;padding-left:100%;animation:marquee 20s linear infinite}
+@keyframes marquee{0%{transform:translate(0,0)}100%{transform:translate(-100%,0)}}
+.like-btn{position:absolute;top:10px;left:10px;width:36px;height:36px;border-radius:999px;background:rgba(255,255,255,.7);backdrop-filter:blur(4px);display:grid;place-items:center;color:#9ca3af;font-size:18px;box-shadow:var(--shadow-sm);transition:color .2s;z-index:15}
+.like-btn.liked{color:red}
+.payment-option{display:flex;align-items:center;gap:12px;padding:14px;border:2px solid var(--line);border-radius:14px;cursor:pointer;transition:border-color .2s,background .2s;background:#fff}
+.payment-option:hover{border-color:#ccc}
+.payment-option.selected{border-color:var(--accent);background:var(--accentLight)}
+.payment-option .radio-dot{width:22px;height:22px;border-radius:999px;border:2px solid var(--line);display:grid;place-items:center;flex-shrink:0;transition:border-color .2s}
+.payment-option.selected .radio-dot{border-color:var(--accent)}
+.payment-option.selected .radio-dot::after{content:'';width:12px;height:12px;border-radius:999px;background:var(--accent)}
+.payment-option i.pay-icon{font-size:22px;color:var(--accent)}
+.review-card{padding:12px;border:1px solid var(--line);border-radius:12px;background:#fafafa}
+.review-card+.review-card{margin-top:10px}
+.review-stars{color:#FFD700;font-size:14px}
+.review-stars .empty{color:#ddd}
+.review-author{font-weight:600;font-size:13px;color:#111}
+.review-text{font-size:13px;color:#444;margin-top:4px}
+.review-date{font-size:11px;color:var(--muted);margin-top:4px}
+.join-banner{background:linear-gradient(135deg,var(--accent) 0%,var(--accentDark) 100%);color:#fff;border-radius:var(--radius);padding:20px;text-align:center;margin-top:16px}
+.join-banner h3{margin:0 0 6px;font-family:Poppins}
+.join-banner p{margin:0 0 12px;opacity:.9;font-size:14px}
+.support-footer{text-align:center;padding:20px 14px;margin-top:16px}
+.support-footer a{color:var(--accent);font-size:13px;font-weight:600;display:inline-flex;align-items:center;gap:6px}
+.contact-card{display:flex;align-items:center;gap:14px;padding:16px;border:1px solid var(--line);border-radius:14px;background:#fff;margin-bottom:10px;cursor:pointer;transition:box-shadow .2s}
+.contact-card:hover{box-shadow:var(--shadow)}
+.contact-icon{width:48px;height:48px;border-radius:14px;display:grid;place-items:center;font-size:20px;flex-shrink:0}
+.contact-icon.email-icon{background:var(--accentLight);color:var(--accentDark)}
+.contact-icon.phone-icon{background:#E6F7EE;color:var(--success)}
+.contact-icon.whatsapp-icon{background:#E6FAE6;color:#25D366}
+.profile-head{display:flex;flex-direction:column;align-items:center;gap:8px;margin:12px 0 16px}
+.avatar{width:96px;height:96px;border-radius:999px;overflow:hidden;border:3px solid var(--accent);box-shadow:0 2px 6px rgba(0,0,0,.08)}
+.avatar img{width:100%;height:100%;object-fit:cover}
+.notif-banner{background:#E6F7EE;border:1px solid #CFF7DF;border-radius:14px;padding:14px;margin-bottom:12px;display:flex;align-items:center;gap:12px}
+.notif-banner.warning{background:#FFF7E6;border-color:#FFE0A3}
+.notif-banner i{font-size:22px;flex-shrink:0}
+.map-container{width:100%;height:220px;border-radius:14px;overflow:hidden;border:1px solid var(--line);margin-top:8px}
+.chatbot-icon{position:fixed;bottom:calc(96px + var(--safe));right:16px;z-index:50;width:56px;height:56px;border-radius:999px;background:var(--accent);color:var(--accentText);box-shadow:var(--shadow);display:flex;align-items:center;justify-content:center;font-size:24px;cursor:pointer;transition:transform .2s}
+.chatbot-icon:hover{transform:scale(1.05)}
+.chatbot-popup{position:fixed;bottom:0;left:0;right:0;width:100%;height:80vh;background:var(--surface);border:none;border-radius:var(--radius) var(--radius) 0 0;box-shadow:var(--shadow);display:flex;flex-direction:column;z-index:50;transform:translateY(100%);opacity:0;pointer-events:none;transition:transform .3s ease,opacity .3s ease;max-height:80vh}
+.chatbot-popup.visible{transform:translateY(0);opacity:1;pointer-events:auto}
+@media(min-width:768px){.chatbot-popup{bottom:calc(160px + var(--safe));left:auto;right:16px;width:320px;height:auto;max-height:400px;border-radius:var(--radius);transform:scale(.95)}.chatbot-popup.visible{transform:scale(1)}}
+.chatbot-header{background:var(--accent);color:var(--accentText);padding:12px 16px;border-top-left-radius:var(--radius);border-top-right-radius:var(--radius);display:flex;align-items:center;justify-content:space-between}
+.chatbot-body{flex:1;padding:16px;overflow-y:auto;display:flex;flex-direction:column;gap:12px}
+.chatbot-msg-container{display:flex;width:100%}
+.chatbot-msg-container.user-msg{justify-content:flex-end}
+.chatbot-msg-container.bot-msg{justify-content:flex-start}
+.chatbot-msg{background:var(--accent);color:var(--accentText);padding:10px 14px;border-radius:18px;max-width:80%;word-wrap:break-word;box-shadow:var(--shadow-sm)}
+.chatbot-msg.bot{background:var(--accentLight);color:#111;border:1px solid var(--line)}
+.chatbot-questions{display:flex;flex-direction:column;gap:8px}
+.chatbot-questions .question-chip{padding:10px 14px;background:var(--accentLight);border:none;border-radius:12px;cursor:pointer;color:#111;font-size:14px;transition:background .2s;text-align:left}
+.chatbot-questions .question-chip:hover{background:#d4edca}
+
+/* City Modal Overlay */
+#city-modal-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,0.8);backdrop-filter:blur(5px);
+  z-index:9999;display:none;flex-direction:column;align-items:center;justify-content:center;padding:20px;
+}
+.city-modal-box{background:#fff;width:100%;max-width:400px;border-radius:24px;padding:24px;text-align:center;box-shadow:0 20px 40px rgba(0,0,0,0.2)}
+.city-option{display:flex;align-items:center;justify-content:center;gap:10px;padding:14px;border:1px solid var(--line);border-radius:14px;margin-bottom:10px;cursor:pointer;transition:all 0.2s;font-weight:600;}
+.city-option:hover{border-color:var(--accent);background:var(--accentLight);}
+
+/* Store Lock Banner */
+.lock-banner{background:#FEE2E2; color:#E11D48; padding:12px; text-align:center; font-weight:bold; border-bottom:1px solid #FECACA;}
+
+/* Zesto Home redesign */
+.home-head{padding:4px 0 12px}
+.home-user-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:12px}
+.home-greeting{font-family:Poppins;font-size:18px;font-weight:700;color:var(--accentDark);margin:0}
+.home-location{display:flex;align-items:center;gap:5px;color:var(--muted);font-size:12px;margin-top:3px}
+.home-location i{color:var(--accent);font-size:12px}
+.home-account-dot{width:42px;height:42px;border-radius:50%;overflow:hidden;border:2px solid var(--accent);background:var(--accentLight);display:grid;place-items:center;flex-shrink:0}
+.home-account-dot img{width:100%;height:100%;object-fit:cover}
+.home-account-dot i{color:var(--accent);font-size:18px}
+.home-search{display:flex;align-items:center;gap:10px;background:#fff;border:1px solid var(--line);border-radius:14px;padding:0 13px;box-shadow:var(--shadow-sm);margin-bottom:14px}
+.home-search i{color:#9CA3AF}
+.home-search input{border:none!important;box-shadow:none!important;padding:13px 0!important;background:transparent!important}
+.home-banner{border-radius:16px;overflow:hidden;background:var(--accentLight);border:1px solid var(--line);box-shadow:var(--shadow-sm);margin-bottom:16px}
+.home-banner img{width:100%;height:180px;object-fit:cover}
+.home-banner-empty{height:140px;display:grid;place-items:center;color:var(--muted);font-weight:600}
+.home-section-title{font-family:Poppins;color:var(--accentDark);font-size:17px;margin:4px 0 10px}
+.home-categories{display:flex;gap:10px;overflow-x:auto;padding:2px 1px 10px;scrollbar-width:none;margin-bottom:8px}
+.home-categories::-webkit-scrollbar{display:none}
+.home-category{flex:0 0 auto;width:72px;padding:3px 4px 6px;border:0;background:transparent;text-align:center;font-size:11px;font-weight:700;color:#333;cursor:pointer;transition:.2s}
+.home-category-img,.home-category-all{width:60px;height:60px;border-radius:50%;margin:0 auto 6px;background:var(--accentLight);border:2px solid #fff;box-shadow:0 1px 5px rgba(0,0,0,.12)}
+.home-category-img{object-fit:cover}
+.home-category-all{display:grid;place-items:center;font-size:20px;color:var(--accent)}
+.home-category.active{color:var(--accentDark)}
+.home-category.active .home-category-img,.home-category.active .home-category-all{border-color:var(--accent);box-shadow:0 0 0 2px rgba(20,90,50,.14)}
+.home-category:active{transform:scale(.96)}
+
+
+/* Custom blocked-account popup — replaces browser alert/domain header */
+#blocked-account-overlay{
+  position:fixed;inset:0;z-index:10000;background:rgba(8,18,14,.58);
+  display:none;align-items:center;justify-content:center;padding:20px;
+  backdrop-filter:blur(4px);
+}
+#blocked-account-overlay.show{display:flex}
+.blocked-account-modal{
+  width:min(92vw,410px);background:#fff;border-radius:24px;padding:25px 22px 21px;
+  text-align:center;box-shadow:0 24px 70px rgba(0,0,0,.28);
+  animation:blockedPopupIn .28s ease-out;
+}
+@keyframes blockedPopupIn{
+  from{opacity:0;transform:translateY(18px) scale(.94)}
+  to{opacity:1;transform:translateY(0) scale(1)}
+}
+.blocked-account-icon{
+  width:76px;height:76px;border-radius:50%;margin:0 auto 15px;
+  display:grid;place-items:center;background:#feecec;color:#dc3545;
+  font-size:30px;position:relative;
+}
+.blocked-account-icon:after{
+  content:"";position:absolute;inset:-5px;border:2px solid rgba(220,53,69,.16);
+  border-radius:50%;animation:blockedRing 1.4s ease-out infinite;
+}
+@keyframes blockedRing{0%{transform:scale(.85);opacity:.9}100%{transform:scale(1.2);opacity:0}}
+.blocked-account-modal h2{margin:0 0 8px;color:#173d2d;font-size:21px}
+.blocked-account-modal p{margin:0;color:#66736d;font-size:14px;line-height:1.55}
+.blocked-account-note{
+  margin-top:13px;padding:11px 12px;border-radius:13px;background:#fff5f5;
+  color:#a6323e;font-size:12px;line-height:1.45;
+}
+.blocked-account-ok{
+  width:100%;margin-top:17px;border:0;border-radius:13px;padding:13px 16px;
+  background:var(--accent);color:#fff;font-weight:800;font-size:14px;cursor:pointer;
+}
+
+
+/* Zesto custom dialog system: avoids browser "github.io says" dialogs */
+#zesto-dialog-overlay{position:fixed;inset:0;z-index:12000;background:rgba(8,18,14,.58);display:none;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)}
+#zesto-dialog-overlay.show{display:flex}
+.zesto-dialog-box{width:min(92vw,420px);background:#fff;border-radius:24px;padding:24px 22px 20px;text-align:center;box-shadow:0 24px 70px rgba(0,0,0,.28);animation:zestoDialogIn .25s ease-out}
+@keyframes zestoDialogIn{from{opacity:0;transform:translateY(15px) scale(.96)}to{opacity:1;transform:translateY(0) scale(1)}}
+.zesto-dialog-icon{width:68px;height:68px;border-radius:50%;margin:0 auto 14px;background:#e7f5ed;color:var(--accent,#145A32);display:grid;place-items:center;font-size:27px}
+.zesto-dialog-title{margin:0 0 8px;font-family:Poppins,Inter,sans-serif;font-size:20px;color:#173d2d}
+.zesto-dialog-text{margin:0;color:#66736d;font-size:14px;line-height:1.55;white-space:pre-line}
+.zesto-dialog-input{width:100%;margin-top:14px;padding:12px 13px;border:1px solid #d7dfda;border-radius:12px;font:inherit;display:none}
+.zesto-dialog-actions{display:flex;gap:10px;margin-top:18px}
+.zesto-dialog-actions button{flex:1;border:0;border-radius:12px;padding:12px 14px;font-weight:800;cursor:pointer}
+#zesto-dialog-cancel{background:#fff;color:#145A32;border:1px solid #145A32;display:none}
+#zesto-dialog-ok{background:var(--accent,#145A32);color:#fff}
+
+</style>
+
+<style id="zesto-live-order-tracker-css">
+@keyframes zestoTrackPulse{
+  0%{box-shadow:0 0 0 0 rgba(20,90,50,.35)}
+  70%{box-shadow:0 0 0 12px rgba(20,90,50,0)}
+  100%{box-shadow:0 0 0 0 rgba(20,90,50,0)}
+}
+@keyframes zestoTrackFlow{
+  0%{top:-45%}
+  100%{top:100%}
+}
+@keyframes zestoLiveDot{
+  0%,100%{opacity:.35;transform:scale(.8)}
+  50%{opacity:1;transform:scale(1.15)}
+}
+.zesto-track-pulse{animation:zestoTrackPulse 1.7s infinite}
+.zesto-track-flow{animation:zestoTrackFlow 1.25s linear infinite}
+.zesto-live-dot{width:7px;height:7px;border-radius:50%;background:var(--accent);display:inline-block;animation:zestoLiveDot 1s infinite}
+</style>
+
+
+<style id="zesto-min-order-modal-css">
+@keyframes zestoModalIn{
+  from{opacity:0;transform:translateY(18px) scale(.97)}
+  to{opacity:1;transform:translateY(0) scale(1)}
+}
+@keyframes zestoIconPulse{
+  0%,100%{transform:scale(1)}
+  50%{transform:scale(1.08)}
+}
+#zesto-min-order-overlay{
+  position:fixed;inset:0;z-index:9999;background:rgba(0,0,0,.52);
+  display:none;align-items:center;justify-content:center;padding:20px;
+}
+#zesto-min-order-overlay.show{display:flex}
+#zesto-min-order-modal{
+  width:min(92vw,430px);background:#fff;border-radius:24px;padding:24px;
+  box-shadow:0 24px 70px rgba(0,0,0,.24);animation:zestoModalIn .28s ease-out;
+}
+.zesto-min-order-icon{
+  width:64px;height:64px;border-radius:50%;margin:0 auto 14px;
+  background:var(--accentLight);color:var(--accent);display:grid;place-items:center;
+  font-size:28px;animation:zestoIconPulse 1.5s ease-in-out infinite;
+}
+.zesto-min-order-title{
+  font-family:Poppins,sans-serif;font-size:22px;font-weight:800;
+  text-align:center;color:var(--accentDark);margin:0 0 8px;
+}
+.zesto-min-order-text{
+  text-align:center;color:var(--muted);font-size:14px;line-height:1.5;margin-bottom:16px;
+}
+.zesto-min-order-rule{
+  display:flex;align-items:center;gap:10px;background:#f7faf8;
+  border:1px solid var(--line);border-radius:14px;padding:12px;margin-top:9px;
+}
+.zesto-min-order-rule i{color:var(--accent);width:22px;text-align:center}
+.zesto-min-order-rule strong{color:var(--accentDark)}
+</style>
+
+
+<style id="zesto-product-full-image-fix">
+.hero-img{background:#fff;display:flex;align-items:center;justify-content:center;overflow:hidden}
+.hero-img img{width:100%;height:100%;object-fit:contain !important;object-position:center center !important}
+</style>
+
+<style id="zesto-loading-only-style">#zesto-splash .zesto-loading-text{color:#4E342E;font-size:22px;font-weight:700;font-family:Arial,sans-serif;letter-spacing:.2px}</style></head>
+<body>
+
+<div id="zesto-dialog-overlay" aria-hidden="true">
+  <div class="zesto-dialog-box" role="dialog" aria-modal="true">
+    <div class="zesto-dialog-icon"><i id="zesto-dialog-icon" class="fa-solid fa-circle-info"></i></div>
+    <h2 id="zesto-dialog-title" class="zesto-dialog-title">Zesto</h2>
+    <p id="zesto-dialog-text" class="zesto-dialog-text"></p>
+    <input id="zesto-dialog-input" class="zesto-dialog-input">
+    <div class="zesto-dialog-actions">
+      <button type="button" id="zesto-dialog-cancel">Cancel</button>
+      <button type="button" id="zesto-dialog-ok">OK</button>
+    </div>
+  </div>
+</div>
+
+
+<div id="blocked-account-overlay" aria-hidden="true">
+  <div class="blocked-account-modal" role="dialog" aria-modal="true">
+    <div class="blocked-account-icon"><i class="fa-solid fa-ban"></i></div>
+    <h2>Ordering Disabled</h2>
+    <p>This account has been blocked by Zesto Admin.</p>
+    <div class="blocked-account-note">You can continue browsing the app, but you cannot place a new order using this email address or phone number.</div>
+    <button type="button" class="blocked-account-ok" id="blocked-account-ok">OK</button>
+  </div>
+</div>
+
+
+<!-- Zesto Splash Screen -->
+<div id="zesto-splash" aria-label="Zesto loading">
+  <div class="zesto-loading-text">Loading...</div>
+</div>
+<style>
+#zesto-splash{position:fixed;inset:0;width:100vw;height:100vh;z-index:99999;background:#F8F4E7;display:flex;align-items:center;justify-content:center;overflow:hidden;opacity:1;visibility:visible;transition:opacity .25s ease,visibility .25s ease;}
+
+#zesto-splash.hide{opacity:0;visibility:hidden;pointer-events:none;}
+</style>
+
+<div id="city-modal-overlay">
+  <div class="city-modal-box">
+    <div style="font-size:48px; color:var(--accent); margin-bottom:12px;"><i class="fa-solid fa-location-dot"></i></div>
+    <h2 style="margin:0 0 8px; font-family:Poppins; color:var(--accentDark)">Welcome to Zesto</h2>
+    <p class="muted" style="margin:0 0 20px;">Please select your city to continue and see available products & pricing.</p>
+    <div id="city-list">
+      </div>
+  </div>
+</div>
+
+<div id="store-app">
+  <div class="animated-banner-wrap" id="animated-banner-wrap" style="display:none">
+    <div class="animated-banner-text" id="animated-banner-text"></div>
+  </div>
+  <div id="app" class="wrap">
+    <header class="topbar">
+      <div class="topbar-inner">
+        <button id="back-btn" class="icon-round" aria-label="Back" style="display:none"><i class="fa-solid fa-arrow-left"></i></button>
+        <img id="app-logo" class="topbar-logo" src="" alt="" style="display:none">
+        <h1 id="page-title" class="title">Zesto</h1>
+      </div>
+    </header>
+    <main id="view" aria-live="polite" style="padding-bottom:96px"></main>
+    <nav class="tabbar">
+      <div class="tabbar-inner four-tabs" id="tabbar-inner">
+        <a class="tab" data-tab="home" href="#/home"><i class="fa-solid fa-house"></i><span>Home</span></a>
+        <a class="tab" data-tab="shop" href="#/shop"><i class="fa-solid fa-magnifying-glass"></i><span>Shop</span></a>
+        <a class="tab" data-tab="cart" href="#/cart"><i class="fa-solid fa-cart-shopping"></i><span>Cart</span></a>
+        <a class="tab" data-tab="account" href="#/account"><i class="fa-regular fa-user"></i><span>Account</span></a>
+      </div>
+    </nav>
+  </div>
+  <div id="toast" class="toast">Added to cart</div>
+</div>
+
+<button class="chatbot-icon" id="chatbot-toggle"><i class="fa-solid fa-comment-dots"></i></button>
+<div class="chatbot-popup" id="chatbot-popup">
+  <div class="chatbot-header">
+    <div style="font-weight:600">Zesto AI</div>
+    <button class="icon-round" style="background:transparent;border:none;color:var(--accentText);width:28px;height:28px" id="chatbot-close"><i class="fa-solid fa-xmark"></i></button>
+  </div>
+  <div class="chatbot-body" id="chatbot-body">
+    <div class="chatbot-questions" id="chatbot-questions"></div>
+  </div>
+</div>
+
+<script>
+
+function zestoDialog(mode,message,defaultValue=''){
+  const ov=document.getElementById('zesto-dialog-overlay');
+  const text=document.getElementById('zesto-dialog-text');
+  const input=document.getElementById('zesto-dialog-input');
+  const ok=document.getElementById('zesto-dialog-ok');
+  const cancel=document.getElementById('zesto-dialog-cancel');
+  const icon=document.getElementById('zesto-dialog-icon');
+  if(!ov||!text||!input||!ok||!cancel){
+    return Promise.resolve(mode==='confirm'?false:mode==='prompt'?null:undefined);
+  }
+  text.textContent=String(message??'');
+  input.style.display=mode==='prompt'?'block':'none';
+  cancel.style.display=(mode==='confirm'||mode==='prompt')?'block':'none';
+  input.value=mode==='prompt'?String(defaultValue??''):'';
+  icon.className=mode==='confirm'?'fa-solid fa-circle-question':mode==='prompt'?'fa-solid fa-pen':'fa-solid fa-circle-info';
+  ov.classList.add('show'); ov.setAttribute('aria-hidden','false');
+  if(mode==='prompt')setTimeout(()=>{input.focus();input.select()},30);
+  return new Promise(resolve=>{
+    const finish=v=>{
+      ov.classList.remove('show');ov.setAttribute('aria-hidden','true');
+      ok.onclick=null;cancel.onclick=null;input.onkeydown=null;
+      resolve(v);
+    };
+    ok.onclick=()=>finish(mode==='prompt'?input.value:mode==='confirm'?true:undefined);
+    cancel.onclick=()=>finish(mode==='prompt'?null:false);
+    input.onkeydown=e=>{if(e.key==='Enter')ok.click();if(e.key==='Escape')cancel.click()};
+  });
+}
+function zAlert(message){return zestoDialog('alert',message)}
+function zConfirm(message){return zestoDialog('confirm',message)}
+function zPrompt(message,defaultValue=''){return zestoDialog('prompt',message,defaultValue)}
+
+const $=s=>document.querySelector(s);
+const $$=s=>Array.from(document.querySelectorAll(s));
+const money=n=>'\u20B9'+(n||0).toLocaleString("en-IN");
+const uid=()=>'p_'+Math.random().toString(36).slice(2)+Date.now().toString(36);
+const readLocal=(k,d)=>{try{return JSON.parse(localStorage.getItem(k)||JSON.stringify(d))}catch{return d}};
+const writeLocal=(k,v)=>localStorage.setItem(k,JSON.stringify(v));
+const escapeHtml=(s="")=>s.replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[m]));
+const safeUrl=(value,fallback="")=>{try{const u=new URL(String(value||""),location.href);if(["http:","https:","data:"].includes(u.protocol))return u.href}catch(e){}return fallback};
+const safeNumber=(value,fallback=0)=>{const n=Number(value);return Number.isFinite(n)&&n>=0?n:fallback};
+const toast=msg=>{const t=$("#toast");t.textContent=msg;t.classList.add("show");setTimeout(()=>t.classList.remove("show"),1400)};
+const routeTo=hash=>{location.hash=hash};
+
+let PROFILE=readLocal("sf_profile",{name:"",email:"",phone:"",address:"",pincode:"",city:"",state:"",district:"",landmark:"",avatar:"",isComplete:false,favorites:[]});
+let BLOCKED_CUSTOMERS=[];
+const blockedCustomersRef=db.ref("blockedCustomers");
+const saveProfile=()=>writeLocal("sf_profile",PROFILE);
+const hasCompleteProfile=()=>!!(PROFILE.name&&PROFILE.email&&PROFILE.phone&&PROFILE.address&&PROFILE.pincode);
+const normBlockEmail=v=>String(v||"").trim().toLowerCase();
+const normBlockPhone=v=>String(v||"").replace(/\D/g,"");
+function blockedCustomerMatch(email,phone){
+  const e=normBlockEmail(email),p=normBlockPhone(phone);
+  return BLOCKED_CUSTOMERS.find(b=>{
+    const be=normBlockEmail(b.email),bp=normBlockPhone(b.phone);
+    return (e&&be&&e===be)||(p&&bp&&p===bp);
+  })||null;
+}
+function showBlockedCustomerMessage(){
+  const ov=document.getElementById("blocked-account-overlay");
+  const btn=document.getElementById("blocked-account-ok");
+  if(!ov||!btn)return;
+  ov.classList.add("show");
+  ov.setAttribute("aria-hidden","false");
+  btn.onclick=()=>{
+    ov.classList.remove("show");
+    ov.setAttribute("aria-hidden","true");
+  };
+}
+async function isCustomerBlockedLive(email,phone){
+  const e=normBlockEmail(email), p=normBlockPhone(phone);
+  if(!e&&!p)return false;
+  try{
+    const snap=await blockedCustomersRef.once("value");
+    const raw=snap.val()||{};
+    return Object.values(raw).some(b=>{
+      const be=normBlockEmail(b?.email), bp=normBlockPhone(b?.phone);
+      return (e&&be&&e===be)||(p&&bp&&p===bp);
+    });
+  }catch(err){
+    console.error("Blocked-customer verification failed:",err);
+    // Fail closed for order placement: if block status cannot be verified, don't create an order.
+    zAlert("We could not verify your account status right now. Please try again.");
+    return true;
+  }
+}
+let CURRENT_CUSTOMER_BLOCKED=false;
+blockedCustomersRef.on("value",s=>{
+  const raw=s.val()||{};
+  BLOCKED_CUSTOMERS=Object.entries(raw).map(([key,b])=>({...b,firebaseKey:key}));
+  const nowBlocked=!!blockedCustomerMatch(PROFILE.email,PROFILE.phone);
+  if(nowBlocked && !CURRENT_CUSTOMER_BLOCKED){
+    CURRENT_CUSTOMER_BLOCKED=true;
+    showBlockedCustomerMessage();
+  }else if(!nowBlocked){
+    CURRENT_CUSTOMER_BLOCKED=false;
+  }
+});
+
+let PRODUCTS=[];
+let CART=readLocal("sf_cart",[]);
+const saveCart=()=>writeLocal("sf_cart",CART);
+
+// --- City & Pricing Logic Variables ---
+let USER_CITY = localStorage.getItem('zesto_city');
+let ALLOWED_CITIES = ['Jaipur', 'Delhi', 'Mumbai'];
+let CONFIG = {};
+
+const getPrice = (p) => {
+    if(!p) return 0;
+    if(USER_CITY && p.cityPricing && p.cityPricing[USER_CITY] && p.cityPricing[USER_CITY].price){
+        return Number(p.cityPricing[USER_CITY].price);
+    }
+    // Customer sees only Admin/customer selling price. vendorPrice is intentionally ignored.
+    return Number(p.adminPrice ?? p.customerPrice ?? p.price ?? 0);
+};
+const getMrp = (p) => {
+    if(!p) return 0;
+    if(USER_CITY && p.cityPricing && p.cityPricing[USER_CITY] && p.cityPricing[USER_CITY].mrp){
+        return Number(p.cityPricing[USER_CITY].mrp);
+    }
+    return Number(p.adminMrp ?? p.customerMrp ?? p.priceMrp ?? 0);
+};
+const getDisc = (p) => {
+    if(!p) return 0;
+    if(USER_CITY && p.cityPricing && p.cityPricing[USER_CITY] && p.cityPricing[USER_CITY].disc){
+        return Number(p.cityPricing[USER_CITY].disc);
+    }
+    return Number(p.discountPercent || 0);
+};
+const getShipping = (p) => p ? safeNumber(p.shipping, safeNumber(CONFIG.shipping,50)) : safeNumber(CONFIG.shipping,50);
+const getCartSubtotal=()=>CART.reduce((a,c)=>{const p=PRODUCTS.find(x=>x.id===c.productId);return a+(p?(getPrice(p)*c.qty):0)},0);
+const getCartItemCount=()=>CART.reduce((n,c)=>n+Math.max(0,Number(c.qty)||0),0);
+const getCartShipping=()=>{
+  const vals=CART.map(c=>{
+    const p=PRODUCTS.find(x=>x.id===c.productId);
+    return p?getShipping(p):0;
+  }).filter(Number.isFinite);
+  return vals.length?Math.max(...vals):0;
+};
+const cartTotal=()=>getCartSubtotal()+getCartShipping();
+const getProductPaymentPrice=(p,method)=>{
+  if(!p)return 0;
+  const fallback=getPrice(p);
+  if(method==="cod"){
+    const v=Number(p.codPrice);
+    return Number.isFinite(v)&&v>0?v:fallback;
+  }
+  if(method==="online"){
+    const v=Number(p.onlinePrice);
+    return Number.isFinite(v)&&v>0?v:fallback;
+  }
+  return fallback;
+};
+const getCartSubtotalForPayment=(method)=>CART.reduce((sum,it)=>{
+  const p=PRODUCTS.find(x=>x.id===it.productId);
+  return sum+(p?getProductPaymentPrice(p,method)*it.qty:0);
+},0);
+const getCartTotalForPayment=(method)=>getCartSubtotalForPayment(method)+getCartShipping();
+const getPaymentPriceText=(method)=>method==="online"?"Online payment price":"Cash on Delivery price";
+const getMinimumOrderQty=()=>Math.max(0,Number(CONFIG.minOrderQty)||0);
+const getMinimumOrderValue=()=>Math.max(0,Number(CONFIG.minOrderValue)||0);
+const getMinimumOrderMessage=()=>{
+  const qty=getMinimumOrderQty(), val=getMinimumOrderValue(), count=getCartItemCount(), subtotal=getCartSubtotal();
+  const parts=[];
+  if(qty>0 && count<qty) parts.push(`Add at least ${qty} item${qty===1?'':'s'} to place this order.`);
+  if(val>0 && subtotal<val) parts.push(`Minimum order value is ${money(val)}.`);
+  return parts.join(' ');
+};
+let ORDERS=[];let RATINGS=[];let CATEGORIES=[];
+let HERO_IMAGE_URL="";let BANNER_TEXT="";let APP_LOGO_URL="";
+
+const productsRef=db.ref('products');
+const ordersRef=db.ref('orders');
+const ratingsRef=db.ref('ratings');
+const appConfigRef=db.ref('config');
+const categoriesRef=db.ref('categories');
+
+let dataFetched={products:false,orders:false,ratings:false,config:false,categories:false};
+
+function showLoader(){$("#view").innerHTML=`<div class="loader" style="margin-top:40px;"><div class="dot"></div><div class="dot"></div><div class="dot"></div><div style="color:var(--accent);font-weight:600;margin-top:16px;">Loading Zesto...</div></div>`}
+
+function showCityModal() {
+    $("#city-list").innerHTML = ALLOWED_CITIES.map(c => `
+        <div class="city-option" onclick="selectCity('${escapeHtml(c)}')">
+           <i class="fa-solid fa-map-pin" style="color:var(--accent)"></i> ${escapeHtml(c)}
+        </div>
+    `).join('');
+    $("#city-modal-overlay").style.display = "flex";
+}
+
+function checkCitySelection() {
+    if (!USER_CITY) {
+        showCityModal();
+        return false;
+    }
+    $("#city-modal-overlay").style.display = "none";
+    return true;
+}
+
+window.selectCity = (c) => { 
+    localStorage.setItem('zesto_city', c); 
+    USER_CITY = c; 
+    PROFILE.city = c;
+    saveProfile();
+    checkCitySelection(); 
+    render(); 
+};
+
+function checkAndRender(){
+    if(dataFetched.products && dataFetched.config && dataFetched.categories){
+        if(checkCitySelection()){
+            render();
+        }
+    } else {
+        showLoader();
+    }
+}
+
+productsRef.on('value',snap=>{
+  const raw=snap.val()||{};
+  const nextProducts=Object.entries(raw).map(([key,p])=>{
+    p=p||{};
+    const urls=Array.isArray(p.imageUrls)?p.imageUrls.filter(Boolean):(p.imageUrl?[p.imageUrl]:[]);
+    return {...p,firebaseKey:p.firebaseKey||key,id:p.id||key,imageUrls:urls,imageUrl:p.imageUrl||urls[0]||""};
+  });
+  // Supabase realtime can briefly refetch while a row is being updated. Do not
+  // wipe a populated product list during that short refresh; it can make a
+  // valid cart item look missing exactly when Checkout is pressed.
+  if(nextProducts.length || !PRODUCTS.length) PRODUCTS=nextProducts;
+  PRODUCTS.sort((a,b)=>(Number(b.createdAt)||0)-(Number(a.createdAt)||0));
+  dataFetched.products=true;
+  checkAndRender();
+});
+ordersRef.on('value',snap=>{ORDERS=snap.val()?Object.values(snap.val()):[];ORDERS.sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));dataFetched.orders=true;checkAndRender()});
+ratingsRef.on('value',snap=>{RATINGS=snap.val()?Object.values(snap.val()):[];dataFetched.ratings=true;checkAndRender()});
+categoriesRef.on('value',snap=>{const raw=snap.val()||{};CATEGORIES=Object.entries(raw).map(([key,c])=>({...c,firebaseKey:key}));dataFetched.categories=true;checkAndRender()});
+appConfigRef.on('value',snap=>{
+    CONFIG=snap.val()||{};
+    HERO_IMAGE_URL=CONFIG.heroImage||"";BANNER_TEXT=CONFIG.bannerText||"";APP_LOGO_URL=CONFIG.appLogo||"";
+    if(CONFIG.allowedCities) ALLOWED_CITIES = CONFIG.allowedCities.split(',').map(s=>s.trim()).filter(Boolean); if(!ALLOWED_CITIES.length) ALLOWED_CITIES=['Jaipur','Delhi','Mumbai'];
+    
+    if(BANNER_TEXT){$("#animated-banner-text").textContent=BANNER_TEXT;$("#animated-banner-wrap").style.display="block"}else{$("#animated-banner-wrap").style.display="none"}
+    if(APP_LOGO_URL){$("#app-logo").src=APP_LOGO_URL;$("#app-logo").style.display="block"}else{$("#app-logo").style.display="none"}
+    dataFetched.config=true;checkAndRender()});
+
+function parseRoute(){const h=location.hash.replace(/^#/,"")||"shop";return{parts:h.split("?")[0].split("/").filter(Boolean)}}
+function setTopbar(title,showBack){$("#page-title").textContent=title;$("#back-btn").style.display=showBack?"inline-grid":"none"}
+function setActiveTab(name){$$(".tab").forEach(t=>t.classList.toggle("active",t.dataset.tab===name))}
+$("#back-btn").addEventListener("click",()=>history.back());
+window.addEventListener("hashchange",()=>{ if(checkCitySelection()) render() });
+window.addEventListener("popstate",()=>{ if(checkCitySelection()) render() });
+
+function ensureProfileBefore(nextHash){if(!hasCompleteProfile()){writeLocal("sf_next",nextHash||"#/checkout");routeTo("#/profile/setup");return false}return true}
+function renderStarIcons(rating,max=5){let h='';for(let i=1;i<=max;i++)h+=i<=rating?'<i class="fa-solid fa-star"></i>':'<i class="fa-solid fa-star empty"></i>';return h}
+function getProductRating(pid){const r=RATINGS.filter(x=>x.productId===pid);if(!r.length)return 0;return(r.reduce((s,x)=>s+x.rating,0)/r.length).toFixed(1)}
+
+function updateTabbar(){
+  const tb=$("#tabbar-inner");
+  tb.classList.add("four-tabs");
+  tb.innerHTML=`
+    <a class="tab" data-tab="home" href="#/home"><i class="fa-solid fa-house"></i><span>Home</span></a>
+    <a class="tab" data-tab="shop" href="#/shop"><i class="fa-solid fa-magnifying-glass"></i><span>Shop</span></a>
+    <a class="tab" data-tab="cart" href="#/cart"><i class="fa-solid fa-cart-shopping"></i><span>Cart</span></a>
+    <a class="tab" data-tab="account" href="#/account"><i class="fa-regular fa-user"></i><span>Account</span></a>`;
+}
+
+function HomeView(){
+  setTopbar("Home",false);setActiveTab("home");
+  const lockBanner = CONFIG.storeLocked ? `<div class="lock-banner"><i class="fa-solid fa-lock"></i> Store is currently closed. We are not accepting orders at this time.</div>` : '';
+  const customerName=PROFILE.name||"Welcome";
+  const city=USER_CITY||PROFILE.city||"Select location";
+  const avatar=PROFILE.avatar
+    ? `<img src="${escapeHtml(PROFILE.avatar)}" alt="">`
+    : `<i class="fa-regular fa-user"></i>`;
+
+  const cats=[...new Set(PRODUCTS.map(p=>p.category).filter(Boolean))];
+  $("#view").innerHTML=`
+    ${lockBanner}
+    <section style="padding:14px">
+
+      <div class="home-head">
+        <div class="home-user-row">
+          <div>
+            <h2 class="home-greeting">Hi, ${escapeHtml(customerName)}</h2>
+            <div class="home-location"><i class="fa-solid fa-location-dot"></i><span>${escapeHtml(city)}</span></div>
+          </div>
+          <a class="home-account-dot" href="#/account" aria-label="Account">${avatar}</a>
+        </div>
+
+        <div class="home-search">
+          <i class="fa-solid fa-magnifying-glass"></i>
+          <input id="home-search" type="search" placeholder="Search for food..." autocomplete="off">
+        </div>
+      </div>
+
+      <div class="home-banner">
+        ${HERO_IMAGE_URL
+          ? `<img src="${HERO_IMAGE_URL}" alt="Zesto Banner">`
+          : `<div class="home-banner-empty">Zesto</div>`}
+      </div>
+
+      <h3 class="home-section-title">Categories</h3>
+      <div class="home-categories" id="home-categories">
+        ${(()=>{const allMeta=CATEGORIES.find(x=>(x.name||'').trim().toLowerCase()==='all');return `<button class="home-category active" data-category="all">${allMeta?.image?`<img class="home-category-img" src="${allMeta.image}" alt="All">`:`<span class="home-category-all"><i class="fa-solid fa-border-all"></i></span>`}<span>All</span></button>`})()}
+        ${cats.map(c=>{const meta=CATEGORIES.find(x=>(x.name||'').trim().toLowerCase()===String(c).trim().toLowerCase());return `<button class="home-category" data-category="${escapeHtml(c)}">${meta?.image?`<img class="home-category-img" src="${meta.image}" alt="${escapeHtml(c)}">`:`<span class="home-category-all"><i class="fa-solid fa-utensils"></i></span>`}<span>${escapeHtml(c)}</span></button>`}).join("")}
+      </div>
+
+      <div class="grid" id="home-grid"></div>
+
+      <div class="support-footer"><a href="#/contact-support"><i class="fa-solid fa-headset"></i> Need Help? Contact Support</a></div>
+    </section>`;
+
+  const grid=$("#home-grid");
+  let activeCategory="all";
+
+  const drawHomeProducts=(term="")=>{
+    const q=(term||"").trim().toLowerCase();
+    const list=PRODUCTS.filter(p=>{
+      const categoryOk=activeCategory==="all"||p.category===activeCategory;
+      const searchOk=!q||(p.name||"").toLowerCase().includes(q)||(p.category||"").toLowerCase().includes(q);
+      return categoryOk&&searchOk;
+    });
+    grid.innerHTML=list.length
+      ? list.map(p=>ProductCard(p)).join("")
+      : `<div class="muted" style="text-align:center;grid-column:1/3;padding:20px">No products found.</div>`;
+    attachProductCardHandlers(grid);
+  };
+
+  drawHomeProducts();
+
+  $("#home-search")?.addEventListener("input",e=>drawHomeProducts(e.target.value));
+
+  $$("#home-categories .home-category").forEach(btn=>{
+    btn.addEventListener("click",()=>{
+      $$("#home-categories .home-category").forEach(b=>b.classList.remove("active"));
+      btn.classList.add("active");
+      activeCategory=btn.dataset.category;
+      drawHomeProducts($("#home-search")?.value||"");
+    });
+  });
+}
+
+function ShopView(){
+  setTopbar("Shop",false);setActiveTab("shop");
+  const cats=[...new Set(PRODUCTS.map(p=>p.category).filter(Boolean))];
+  const lockBanner = CONFIG.storeLocked ? `<div class="lock-banner"><i class="fa-solid fa-lock"></i> Store is currently closed.</div>` : '';
+  
+  $("#view").innerHTML=`
+    ${lockBanner}
+    <section style="padding:14px">
+      <div class="filters"><button class="chip active" data-filter="all">All</button>${cats.map(c=>`<button class="chip" data-filter="${escapeHtml(c)}">${escapeHtml(c)}</button>`).join("")}</div>
+      <div class="card" style="padding:10px 12px;margin:8px 0 12px;display:flex;gap:10px;align-items:center">
+        <i class="fa-solid fa-magnifying-glass" style="color:#9CA3AF"></i>
+        <input id="shop-search" placeholder="Search products..." style="border:none;padding:10px 0;outline:none">
+      </div>
+      <div class="grid" id="shop-grid"></div>
+      <div class="support-footer"><a href="#/contact-support"><i class="fa-solid fa-headset"></i> Need Help? Contact Support</a></div>
+    </section>`;
+  const grid=$("#shop-grid");let activeFilter="all";
+  const draw=(term="")=>{
+    const list=PRODUCTS.filter(p=>(activeFilter==="all"||p.category===activeFilter)&&(!term||String(p.name||'').toLowerCase().includes(term.toLowerCase())));
+    grid.innerHTML=list.length?list.map(p=>ProductCard(p)).join(""):`<div class="muted" style="text-align:center;grid-column:1/3">No products found.</div>`;
+    attachProductCardHandlers(grid);
+  };
+  draw();
+  $("#shop-search").addEventListener("input",e=>draw(e.target.value));
+  $$(".filters .chip").forEach(btn=>btn.addEventListener("click",()=>{$$(".filters .chip").forEach(b=>b.classList.remove("active"));btn.classList.add("active");activeFilter=btn.dataset.filter;draw($("#shop-search").value)}));
+}
+
+function getProductImage(p){
+  if(!p)return "";
+  if(Array.isArray(p.imageUrls) && p.imageUrls.length)return p.imageUrls.find(Boolean)||"";
+  return p.imageUrl||"";
+}
+
+function ProductCard(p){
+  const disc = getDisc(p);
+  const mrp = getMrp(p);
+  const price = getPrice(p);
+  
+  const off=disc?`<div class="discount-badge">${disc}% OFF</div>`:"";
+  const avg=getProductRating(p.id);
+  const stars=avg>0?`<div class="star-rating">${avg} <i class="fa-solid fa-star"></i></div>`:'';
+  const isFav=PROFILE.favorites.includes(p.id);
+  const outOfStockOverlay = p.outOfStock ? `<div style="position:absolute; inset:0; background:rgba(255,255,255,0.6); backdrop-filter:grayscale(100%); display:flex; align-items:center; justify-content:center; z-index:10;"><span style="background:#E11D48; color:white; padding:6px 12px; border-radius:999px; font-weight:bold; font-size:12px; letter-spacing:1px;">OUT OF STOCK</span></div>` : '';
+  const shipping = getShipping(p);
+  
+  return`<a class="card p-card" href="#/product/${p.id}" data-open="${p.id}">
+    <button class="like-btn ${isFav?'liked':''}" data-product-id="${p.id}" aria-label="Fav"><i class="fa-solid fa-heart"></i></button>
+    <div class="p-img"><img src="${getProductImage(p)}" alt="${escapeHtml(p.name)}">${off}${outOfStockOverlay}</div>
+    <div class="p-meta"><div class="p-title">${escapeHtml(p.name)}</div>
+      <div style="display:flex;align-items:center;justify-content:space-between">
+        <div class="price-line"><div style="font-weight:700;color:var(--accentDark)">${money(price)}</div>${mrp?`<div class="strike">${money(mrp)}</div>`:""}</div>${stars}
+      </div>
+      <div class="muted" style="font-size:12px">Shipping: ${shipping === 0 ? 'Free' : money(shipping)}</div>
+    </div></a>`;
+}
+
+function attachProductCardHandlers(scope){
+  if(!scope)return;
+  scope.querySelectorAll("[data-open]").forEach(el=>el.addEventListener("click",e=>{e.preventDefault();routeTo(`#/product/${el.dataset.open}`)}));
+  scope.querySelectorAll(".like-btn").forEach(btn=>{
+    btn.addEventListener("click",e=>{e.preventDefault();e.stopPropagation();toggleFavorite(btn.dataset.productId,btn)});
+    btn.classList.toggle('liked',PROFILE.favorites.includes(btn.dataset.productId));
+  });
+}
+
+function ProductView(id){
+  const p=PRODUCTS.find(x=>x.id===id);if(!p){routeTo("#/shop");return}
+  setTopbar(p.name,true);setActiveTab("");
+  const avg=getProductRating(p.id);
+  const pRatings=RATINGS.filter(r=>r.productId===id);
+  const isOrdered=ORDERS.some(o=>o.customer&&o.customer.email===PROFILE.email&&o.items&&o.items.some(i=>i.productId===id));
+  const isFav=PROFILE.favorites.includes(p.id);
+  
+  const shipping = getShipping(p);
+  const price = getPrice(p);
+  const mrp = getMrp(p);
+  const disc = getDisc(p);
+  
+  let reviewsHtml='';
+  if(pRatings.length>0){
+    reviewsHtml=`<div style="margin-top:20px"><h4 style="margin:0 0 12px;font-family:Poppins;color:var(--accentDark)"><i class="fa-solid fa-comments"></i> Customer Reviews (${pRatings.length})</h4>
+      ${pRatings.map(r=>`<div class="review-card"><div style="display:flex;align-items:center;justify-content:space-between"><div class="review-author">${escapeHtml(r.userName||r.userEmail||'Anonymous')}</div><div class="review-stars">${renderStarIcons(r.rating)}</div></div>${r.reviewText?`<div class="review-text">${escapeHtml(r.reviewText)}</div>`:''}<div class="review-date">${r.createdAt?new Date(r.createdAt).toLocaleDateString():''}</div></div>`).join('')}</div>`;
+  }
+  
+  const lockBanner = CONFIG.storeLocked ? `<div class="lock-banner"><i class="fa-solid fa-lock"></i> Store is currently closed. Ordering is disabled.</div>` : '';
+
+  $("#view").innerHTML=`
+    ${lockBanner}
+    <section>
+      <div class="hero-img" style="position:relative"><img src="${getProductImage(p)}" alt="${escapeHtml(p.name)}" style="${p.outOfStock ? 'filter:grayscale(100%)' : ''}">
+        ${p.outOfStock ? `<div style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center;"><span style="background:#E11D48; color:white; padding:10px 20px; border-radius:999px; font-weight:bold; font-size:18px; letter-spacing:1px; box-shadow:var(--shadow);">OUT OF STOCK</span></div>` : ''}
+      </div>
+      <div style="padding:0 16px 16px">
+        <div style="display:flex;align-items:start;justify-content:space-between;gap:8px">
+          <div>
+            <h2 style="margin:0 0 6px;font-family:Poppins;color:var(--accentDark)">${escapeHtml(p.name)}</h2>
+            <div class="price-line" style="margin:6px 0">
+              <div style="font-family:Poppins;font-weight:700;font-size:22px;color:var(--accentDark)">${money(price)}</div>
+              ${mrp?`<div class="strike">${money(mrp)}</div>`:""}
+              ${disc?`<span class="badge-off">${disc}% OFF</span>`:""}
+            </div>
+            ${avg>0?`<div class="star-rating">${avg} <i class="fa-solid fa-star"></i> (${pRatings.length} reviews)</div>`:''}
+            <div class="muted" style="max-width:560px">${escapeHtml(p.description||"")}</div>
+            <div class="muted" style="margin-top:8px">Shipping: ${shipping === 0 ? 'Free Delivery' : money(shipping)}</div>
+          </div>
+          <button class="icon-round ${isFav?'liked':''}" id="product-like-btn" style="${isFav?'color:red':''}"><i class="fa-solid fa-heart"></i></button>
+        </div>
+        <div style="margin:16px 0 8px;font-weight:700">Quantity</div>
+        <div id="qty-row" style="display:flex;gap:10px">${[1,2,5,10].map((q,i)=>`<button class="size-btn ${i===0?'active':''}" data-qty="${q}">${q}</button>`).join("")}</div>
+        <div style="position:sticky;bottom:calc(84px + var(--safe));margin-top:16px">
+          <button class="btn btn-block" id="buy-now" style="background:var(--success);margin-bottom:10px"><i class="fa-solid fa-bolt"></i> Buy Now</button>
+          <button class="btn btn-block" id="add-to-cart"><i class="fa-solid fa-cart-plus"></i> Add to Cart</button>
+        </div>
+        ${isOrdered?`<div class="card pad" style="margin-top:16px"><h4 style="margin:0 0 10px;font-family:Poppins;color:var(--accentDark)">Rate & Review this product</h4>
+          <div id="rate-stars" class="rate-stars" style="font-size:24px;color:#ccc">${[1,2,3,4,5].map(i=>`<i class="fa-solid fa-star" data-rating="${i}"></i>`).join('')}</div>
+          <textarea id="review-text" placeholder="Write your review here... (optional)" style="margin-top:10px;min-height:70px"></textarea>
+          <button class="btn" id="submit-review-btn" style="margin-top:10px"><i class="fa-solid fa-paper-plane"></i> Submit Review</button></div>`:''}
+        ${reviewsHtml}
+      </div>
+    </section>`;
+    
+  let selectedQty=1,selectedRating=0;
+  $("#qty-row").querySelectorAll(".size-btn").forEach(b=>b.addEventListener("click",()=>{$("#qty-row").querySelectorAll(".size-btn").forEach(x=>x.classList.remove("active"));b.classList.add("active");selectedQty=Number(b.dataset.qty)}));
+  $("#product-like-btn").addEventListener("click",e=>{e.stopPropagation();toggleFavorite(p.id,$("#product-like-btn"))});
+  
+  const isLocked = CONFIG.storeLocked;
+  const btnBuy = $("#buy-now"); const btnAdd = $("#add-to-cart");
+
+  if (p.outOfStock || isLocked) {
+      btnBuy.disabled = true;
+      btnAdd.disabled = true;
+      if (isLocked) {
+          btnBuy.innerHTML = `<i class="fa-solid fa-lock"></i> Store Closed`;
+          btnAdd.innerHTML = `<i class="fa-solid fa-lock"></i> Store Closed`;
+      } else {
+          btnBuy.innerHTML = `<i class="fa-solid fa-ban"></i> Out of Stock`;
+          btnAdd.innerHTML = `<i class="fa-solid fa-ban"></i> Out of Stock`;
+      }
+  } else {
+      btnBuy.addEventListener("click",()=>{addToCart(p.id,"NA",selectedQty);if(ensureProfileBefore("#/checkout")){routeTo("#/checkout")}});
+      $("#add-to-cart").addEventListener("click",()=>{addToCart(p.id,"NA",selectedQty);toast("Added to cart");routeTo("#/cart")});
+  }
+
+  const rateStars=$("#rate-stars");
+  if(rateStars){
+    const existing=RATINGS.find(r=>r.productId===id&&r.userEmail===PROFILE.email);
+    if(existing){selectedRating=existing.rating;for(let i=1;i<=existing.rating;i++)rateStars.querySelector(`[data-rating="${i}"]`).classList.add("active");if(existing.reviewText&&$("#review-text"))$("#review-text").value=existing.reviewText}
+    rateStars.querySelectorAll(".fa-star").forEach(star=>star.addEventListener("click",()=>{selectedRating=Number(star.dataset.rating);rateStars.querySelectorAll(".fa-star").forEach(s=>s.classList.remove("active"));for(let i=1;i<=selectedRating;i++)rateStars.querySelector(`[data-rating="${i}"]`).classList.add("active")}));
+  }
+  const submitBtn=$("#submit-review-btn");
+  if(submitBtn)submitBtn.addEventListener("click",()=>{if(!selectedRating){zAlert("Please select a star rating.");return}submitRating(id,selectedRating,PROFILE.email,PROFILE.name,($("#review-text")?.value||"").trim())});
+}
+
+function submitRating(productId,rating,userEmail,userName,reviewText){
+  const existing=RATINGS.find(r=>r.productId===productId&&r.userEmail===userEmail);
+  const data={productId,userEmail,userName:userName||'',rating,reviewText:reviewText||'',createdAt:Date.now()};
+  if(existing){db.ref('ratings/'+existing.firebaseKey).update(data).then(()=>toast("Review updated!")).catch(()=>zAlert("Failed."))}
+  else{const k=db.ref('ratings').push().key;db.ref('ratings/'+k).set({...data,firebaseKey:k}).then(()=>toast("Review submitted!")).catch(()=>zAlert("Failed."))}
+}
+function toggleFavorite(pid,btn){if(PROFILE.favorites.includes(pid)){PROFILE.favorites=PROFILE.favorites.filter(id=>id!==pid);btn?.classList.remove('liked');btn&&(btn.style.color='');toast("Removed")}else{PROFILE.favorites.push(pid);btn?.classList.add('liked');btn&&(btn.style.color='red');toast("Added to favorites")}saveProfile()}
+
+function CartView(){
+  setTopbar("Shopping Cart",true);setActiveTab("cart");
+  const total=cartTotal();
+  const shipT=getCartShipping();
+  const sub=getCartSubtotal();
+  // Payment-specific totals are needed by the cart summary.
+  // Without these, CartView throws a ReferenceError after changing only the title.
+  const codTotal=getCartTotalForPayment("cod");
+  const onlineTotal=getCartTotalForPayment("online");
+  
+  const isLocked = CONFIG.storeLocked;
+  const checkoutBtn = isLocked ? 
+      `<button class="btn btn-block" disabled style="background:#ccc;color:#666"><i class="fa-solid fa-lock"></i> Store Currently Closed</button>` : 
+      `<button class="btn btn-block" id="to-checkout"><i class="fa-solid fa-lock"></i> Proceed to Checkout</button>`;
+
+  $("#view").innerHTML=`<section style="padding:14px">${CART.length===0?`<div class="card pad" style="text-align:center;padding:26px"><div style="font-size:48px;color:var(--accent);margin-bottom:12px"><i class="fa-solid fa-cart-shopping"></i></div><div class="muted">Your cart is empty.</div><div style="margin-top:10px"><a class="btn btn-outline" href="#/shop">Browse Products</a></div></div>`:`
+    ${isLocked ? `<div class="lock-banner" style="border-radius:10px; margin-bottom:12px;"><i class="fa-solid fa-lock"></i> Store is currently closed.</div>` : ''}
+    <div class="cart-list" id="cart-list">${CART.map(r=>CartItem(r)).join("")}</div>
+    <div class="card sticky-sheet" style="margin-top:16px">
+      <div class="row"><div class="muted">Subtotal</div><div>${money(sub)}</div></div>
+      <div class="row"><div class="muted">Shipping</div><div>${shipT === 0 ? 'Free' : money(shipT)}</div></div>
+      <div class="sep"></div>
+      <div class="row" style="font-weight:800;color:var(--accentDark)"><div>Total</div><div>${money(total)}</div></div>
+        <div class="row" style="margin-top:8px;font-weight:800;color:var(--accent)"><div id="payment-payable-label">Payable Amount</div><div id="payment-payable-amount">${money(CONFIG.codEnabled!==false?codTotal:onlineTotal)}</div></div>
+      <div style="margin-top:10px">${checkoutBtn}</div>
+    </div>`}</section>`;
+  
+  if(!isLocked) {
+      attachCartHandlers();
+      $("#to-checkout")?.addEventListener("click",()=>{if(ensureProfileBefore("#/checkout"))routeTo("#/checkout")});
+  }
+}
+function CartItem(it){
+  const p=PRODUCTS.find(x=>x.id===it.productId);if(!p)return"";
+  const pPrice = getPrice(p);
+  const mrp = getMrp(p);
+  const iT= pPrice*it.qty;
+  return`<div class="cart-item" data-id="${it.productId}"><img src="${getProductImage(p)}" alt="${escapeHtml(p.name)}"><div><div style="font-weight:700">${escapeHtml(p.name)}</div><div class="price-line" style="margin-top:4px"><div style="font-weight:700;color:var(--accentDark)">${money(iT)}</div>${mrp?`<div class="strike">${money(mrp*it.qty)}</div>`:""}</div><div class="qty"><button class="circle-btn" data-dec>-</button><div>${it.qty}</div><button class="circle-btn primary" data-inc>+</button><button class="circle-btn" data-rem><i class="fa-regular fa-trash-can"></i></button></div></div></div>`;
+}
+function attachCartHandlers(){$$("#cart-list .cart-item").forEach(item=>{const pid=item.dataset.id;item.querySelector("[data-inc]").addEventListener("click",()=>changeQty(pid,+1));item.querySelector("[data-dec]").addEventListener("click",()=>changeQty(pid,-1));item.querySelector("[data-rem]").addEventListener("click",()=>removeFromCart(pid))})}
+function addToCart(pid,size,qty){
+  const __pid=arguments[0];
+  const __p=PRODUCTS.find(x=>String(x.id||x.firebaseKey||'')===String(__pid||''));
+  if(__p && (__p.active===false || ['out_of_stock','out'].includes(String(__p.stockStatus||'').toLowerCase()))){zAlert(`${__p.name||'This product'} is OUT OF STOCK.`);return;}
+const idx=CART.findIndex(x=>x.productId===pid);if(idx>-1)CART[idx].qty+=qty;else CART.push({productId:pid,size,qty});saveCart()}
+function changeQty(pid,d){const idx=CART.findIndex(x=>x.productId===pid);if(idx===-1)return;CART[idx].qty=Math.max(1,CART[idx].qty+d);saveCart();render()}
+function removeFromCart(pid){CART=CART.filter(x=>x.productId!==pid);saveCart();render()}
+
+
+function showMinimumOrderModal(){
+  const qty=getMinimumOrderQty();
+  const val=getMinimumOrderValue();
+  const count=getCartItemCount();
+  const subtotal=getCartSubtotal();
+
+  const rules=[];
+  if(qty>0){
+    rules.push(`<div class="zesto-min-order-rule">
+      <i class="fa-solid fa-box"></i>
+      <div><div class="muted" style="font-size:11px">Minimum items</div>
+      <strong>${qty} item${qty===1?'':'s'} required</strong>
+      <div class="muted" style="font-size:11px">Your cart: ${count} item${count===1?'':'s'}</div></div>
+    </div>`);
+  }
+  if(val>0){
+    rules.push(`<div class="zesto-min-order-rule">
+      <i class="fa-solid fa-indian-rupee-sign"></i>
+      <div><div class="muted" style="font-size:11px">Minimum order value</div>
+      <strong>${money(val)} required</strong>
+      <div class="muted" style="font-size:11px">Your cart value: ${money(subtotal)}</div></div>
+    </div>`);
+  }
+
+  const overlay=document.getElementById("zesto-min-order-overlay");
+  const rulesEl=document.getElementById("zesto-min-order-rules");
+  if(!overlay||!rulesEl)return;
+  rulesEl.innerHTML=rules.join("");
+  overlay.classList.add("show");
+  overlay.setAttribute("aria-hidden","false");
+}
+function hideMinimumOrderModal(){
+  const overlay=document.getElementById("zesto-min-order-overlay");
+  if(!overlay)return;
+  overlay.classList.remove("show");
+  overlay.setAttribute("aria-hidden","true");
+}
+document.addEventListener("click",e=>{
+  if(e.target?.id==="zesto-min-order-close" || e.target?.id==="zesto-min-order-overlay"){
+    hideMinimumOrderModal();
+  }
+});
+
+
+async function verifyCartStockLive(){
+  try{
+    // PRODUCTS is kept current by the Supabase realtime listener above.
+    // Do not perform a second child-key lookup here: public product IDs and
+    // database row keys can differ, which previously caused false OUT OF STOCK.
+    for(const it of CART){
+      const id=String(it.productId||'').trim();
+      if(!id)return {ok:false,name:'Product'};
+      let p=PRODUCTS.find(x=>String(x.id||'')===id || String(x.firebaseKey||'')===id);
+      // If a realtime refresh happened at the exact checkout moment, reload the
+      // complete products root once and match by public id OR database key.
+      if(!p){
+        const freshSnap=await productsRef.once('value');
+        const freshRaw=freshSnap.val()||{};
+        p=Object.entries(freshRaw).map(([key,v])=>({...((v&&typeof v==='object')?v:{}),firebaseKey:v?.firebaseKey||key,id:v?.id||key}))
+          .find(x=>String(x.id||'')===id || String(x.firebaseKey||'')===id);
+      }
+      // The item was already added from the live catalogue. A temporary missing
+      // refetch is not proof of OUT OF STOCK; only an explicit stock flag blocks it.
+      if(!p) continue;
+      const stockStatus=String(p.stockStatus||'').trim().toLowerCase();
+      const explicitlyOut = p.outOfStock===true || String(p.outOfStock).toLowerCase()==='true' || p.active===false || ['out_of_stock','out','out of stock'].includes(stockStatus);
+      if(explicitlyOut){
+        return {ok:false,name:String(p.name||'This product')};
+      }
+    }
+    return {ok:true};
+  }catch(err){
+    console.error('Live stock verification failed:',err);
+    return {ok:false,error:true,name:'Product'};
+  }
+}
+
+
+function getValidOrderItems(items){
+  return (Array.isArray(items)?items:[]).filter(it=>{
+    if(!it || typeof it!=="object") return false;
+    const name=String(it.name||"").trim();
+    const productId=String(it.productId||"").trim();
+    const qty=Number(it.qty);
+    if(!name || !productId || !Number.isFinite(qty) || qty<=0) return false;
+    return true;
+  });
+}
+function getValidCartRows(){
+  return (Array.isArray(CART)?CART:[]).map(it=>{
+    const p=PRODUCTS.find(x=>String(x.id||x.firebaseKey||"")===String(it?.productId||""));
+    return {cart:it,product:p};
+  }).filter(row=>row.product && String(row.product.name||"").trim() && Number(row.cart?.qty)>0);
+}
+
+function CheckoutView(){
+  if(CART.length===0 || CONFIG.storeLocked){routeTo("#/cart");return}
+  setTopbar("Checkout",true);setActiveTab("");
+  const total=cartTotal();const shipT=getCartShipping();const sub=getCartSubtotal();
+  const codTotal=getCartTotalForPayment("cod"); const onlineTotal=getCartTotalForPayment("online");
+  
+  $("#view").innerHTML=`
+    <section style="padding:14px">
+      <div class="card pad">
+        <h3 style="margin:0 0 10px;font-family:Poppins;color:var(--accentDark)">Contact Information</h3>
+        <label>Full Name</label><input id="ch-name" required>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><label>Email</label><input id="ch-email" type="email" required></div><div><label>Phone</label><input id="ch-phone" type="tel" required></div></div>
+        <h3 style="margin:16px 0 8px;font-family:Poppins;color:var(--accentDark)">Shipping Address</h3>
+        <label>Address</label><input id="ch-address" required>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><label>City</label><input id="ch-city" readonly style="background:#f0f0f0; color:#666;"></div><div><label>Pincode</label><input id="ch-pincode" required></div></div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px"><div><label>State</label><input id="ch-state"></div><div><label>District</label><input id="ch-district"></div></div>
+        <label>Landmark</label><input id="ch-landmark">
+        
+      </div>
+      <div class="card pad" style="margin-top:16px">
+<h3 style="margin:0 0 12px;font-family:Poppins;color:var(--accentDark)">Payment Method</h3>
+        <div style="display:flex;flex-direction:column;gap:10px" id="payment-methods">
+          ${CONFIG.codEnabled!==false?`<div class="payment-option" data-method="cod"><div class="radio-dot"></div><i class="fa-solid fa-money-bill-wave pay-icon"></i><div><div style="font-weight:700;color:#111">Cash on Delivery · ${money(codTotal)}</div><div class="muted" style="font-size:12px">${getPaymentPriceText("cod")}</div></div></div>`:`<div class="payment-option" style="opacity:.55;cursor:not-allowed" aria-disabled="true"><i class="fa-solid fa-money-bill-wave pay-icon"></i><div><div style="font-weight:700;color:#111">Cash on Delivery</div><div class="muted" style="font-size:12px">Not available right now</div></div></div>`}
+          ${CONFIG.onlinePaymentEnabled!==false?`<div class="payment-option" data-method="online"><div class="radio-dot"></div><i class="fa-solid fa-credit-card pay-icon"></i><div><div style="font-weight:700;color:#111">Pay Online (UPI) · ${money(onlineTotal)}</div><div class="muted" style="font-size:12px">${getPaymentPriceText("online")}</div></div></div>`:`<div class="payment-option" style="opacity:.55;cursor:not-allowed" aria-disabled="true"><i class="fa-solid fa-credit-card pay-icon"></i><div><div style="font-weight:700;color:#111">Pay Online (UPI)</div><div class="muted" style="font-size:12px">Not available right now</div></div></div>`}
+        </div>
+      </div>
+      <div class="card sticky-sheet" style="margin-top:16px">
+        <div class="row"><div class="muted">Subtotal</div><div>${money(sub)}</div></div>
+        <div class="row"><div class="muted">Shipping</div><div>${shipT === 0 ? 'Free' : money(shipT)}</div></div>
+        <div class="sep"></div>
+        <div class="row" style="font-weight:800;color:var(--accentDark)"><div>Total</div><div>${money(total)}</div></div>
+        ${getMinimumOrderMessage()?`<div id="minimum-order-warning" class="notif-banner warning" style="margin-top:10px"><i class="fa-solid fa-circle-exclamation"></i><div><strong>Minimum order requirement</strong><div style="font-size:12px">Please meet the minimum item count and order value shown below before placing your order.</div></div></div>`:''}
+        <div style="margin-top:10px"><button class="btn btn-block" id="checkout-next" disabled style="opacity:0.5;cursor:not-allowed;"><i class="fa-solid fa-check"></i> Place Order</button></div>
+      </div>
+    </section>`;
+    
+  $("#ch-name").value=PROFILE.name||"";$("#ch-email").value=PROFILE.email||"";$("#ch-phone").value=PROFILE.phone||"";
+  $("#ch-address").value=PROFILE.address||"";$("#ch-city").value=USER_CITY||PROFILE.city||"";$("#ch-pincode").value=PROFILE.pincode||"";
+  $("#ch-state").value=PROFILE.state||"";$("#ch-district").value=PROFILE.district||"";$("#ch-landmark").value=PROFILE.landmark||"";
+  
+  // Delivery GPS/map removed. Checkout no longer requires a live location.
+  $("#checkout-next").disabled = false;
+  $("#checkout-next").style.opacity = "1";
+  $("#checkout-next").style.cursor = "pointer";
+  
+  const availablePaymentOptions=$$("#payment-methods .payment-option[data-method]");
+  let payMethod=CONFIG.codEnabled!==false?"cod":(CONFIG.onlinePaymentEnabled!==false?"online":"");
+  const updatePaymentPayable=()=>{
+    const amt=getCartTotalForPayment(payMethod);
+    const amountEl=$("#payment-payable-amount"), labelEl=$("#payment-payable-label");
+    if(amountEl) amountEl.textContent=money(amt);
+    if(labelEl) labelEl.textContent=payMethod==="online"?"Online Payable":"COD Payable";
+  };
+  const initialPayment=availablePaymentOptions.find(opt=>opt.dataset.method===payMethod);
+  if(initialPayment) initialPayment.classList.add("selected");
+  updatePaymentPayable();
+  availablePaymentOptions.forEach(opt=>opt.addEventListener("click",()=>{availablePaymentOptions.forEach(o=>o.classList.remove("selected"));opt.classList.add("selected");payMethod=opt.dataset.method;updatePaymentPayable()}));
+  $("#checkout-next").addEventListener("click",async()=>{
+    // Re-check live payment availability so an old/open checkout cannot bypass an Admin change.
+    let livePaymentCfg=CONFIG;
+    try{
+      const cfgSnap=await appConfigRef.once("value");
+      const liveCfg=cfgSnap.val()||{};
+      livePaymentCfg=liveCfg;
+      const codEnabled=liveCfg.codEnabled!==false;
+      const onlineEnabled=liveCfg.onlinePaymentEnabled!==false;
+      if(!payMethod || (payMethod==="cod"&&!codEnabled) || (payMethod==="online"&&!onlineEnabled)){
+        await zAlert(payMethod==="cod"?"Cash on Delivery is currently not available. Please choose Online Payment.":payMethod==="online"?"Online Payment is currently not available. Please choose Cash on Delivery.":"No payment method is currently available.");
+        render();
+        return;
+      }
+    }catch(err){
+      console.error("Payment availability check failed:",err);
+      await zAlert("Payment availability could not be verified. Please check your internet and try again.");
+      return;
+    }
+    const minimumOrderMessage=getMinimumOrderMessage();
+    if(minimumOrderMessage){ showMinimumOrderModal(); return; }
+    const stockCheck=await verifyCartStockLive();
+    if(!stockCheck.ok){
+      if(stockCheck.error) await zAlert("Product availability could not be verified. Please check your internet and try again.");
+      else await zAlert(`${stockCheck.name} is currently OUT OF STOCK. Please remove it from your cart.`);
+      return;
+    }
+
+    const checkoutEmail=$("#ch-email").value.trim(), checkoutPhone=$("#ch-phone").value.trim();
+    if(await isCustomerBlockedLive(checkoutEmail,checkoutPhone)){showBlockedCustomerMessage();return}
+    PROFILE.name=$("#ch-name").value.trim();PROFILE.email=checkoutEmail;PROFILE.phone=checkoutPhone;
+    PROFILE.address=$("#ch-address").value.trim();PROFILE.city=$("#ch-city").value.trim();PROFILE.pincode=$("#ch-pincode").value.trim();
+    PROFILE.state=$("#ch-state").value.trim();PROFILE.district=$("#ch-district").value.trim();PROFILE.landmark=$("#ch-landmark").value.trim();
+    PROFILE.isComplete=hasCompleteProfile();if(!PROFILE.isComplete){zAlert("Please fill name, email, phone, address and pincode.");return}
+    saveProfile();
+    
+    const validCartRows=getValidCartRows();
+    if(!validCartRows.length){
+      zAlert("No valid product found in your cart. Please add the product again.");
+      CART=[]; saveCart(); routeTo("#/cart"); return;
+    }
+    const items=validCartRows.map(({cart:it,product:p})=>{
+        const selectedPrice=getProductPaymentPrice(p,payMethod);
+        return {productId:String(p.id||p.firebaseKey||it.productId),name:String(p.name||"").trim(),price:selectedPrice,mrp:getMrp(p),shipping:getShipping(p),qty:Math.max(1,Number(it.qty)||1),size:"NA",paymentMethodPrice:payMethod}
+    });
+    const orderShipping=getCartShipping();
+    const amount=items.reduce((sum,it)=>sum+(Number(it.price)||0)*(Number(it.qty)||0),0)+orderShipping;
+    const orderId="ZST-"+Date.now().toString().slice(-8);
+    const orderBase={orderId,items,customer:{...PROFILE},amount,orderShipping,paymentPricing:{method:payMethod,finalAmount:amount,source:"per_product"}};
+    if(payMethod==="online"){writeLocal("sf_pending",{...orderBase,status:"Online Payment - Pending",paymentMethod:"online"});routeTo("#/pay/online")}
+    else{writeLocal("sf_pending",{...orderBase,status:"COD - Pending",paymentMethod:"cod"});routeTo("#/cod/review")}
+  });
+}
+
+function OnlinePayView(){
+  setTopbar("Pay Online",true);setActiveTab("");
+  const pend=readLocal("sf_pending",null);if(!pend){routeTo("#/cart");return}
+
+  const amount=pend.amount||0;
+  const upiId=String(CONFIG.upiId||"").trim();
+  const qrImage=typeof CONFIG.upiQrImage==="string"?CONFIG.upiQrImage.trim():"";
+
+  $("#view").innerHTML=`
+    <section style="padding:14px">
+      <div class="card pad" style="text-align:center">
+        <h3 style="margin:0 0 6px;font-family:Poppins;color:var(--accentDark)">
+          <i class="fa-solid fa-qrcode"></i> Pay Online
+        </h3>
+
+        <p class="muted" style="margin:0 0 14px">
+          Complete payment of <strong style="color:var(--accentDark)">${money(amount)}</strong>
+        </p>
+
+        ${qrImage ? `
+          <div style="background:#fff;border:1px solid var(--line);border-radius:14px;padding:18px;display:inline-block">
+            <img id="payment-qr-image"
+                 src="${escapeHtml(qrImage)}"
+                 alt="UPI payment QR code"
+                 style="width:230px;height:230px;object-fit:contain;border-radius:12px;background:#fff">
+          </div>
+          <div style="margin-top:10px">
+            <button class="btn btn-outline" id="download-payment-qr" type="button">
+              <i class="fa-solid fa-download"></i> Download QR
+            </button>
+          </div>
+        ` : `
+          <div class="notif-banner warning" style="text-align:left">
+            <i class="fa-solid fa-circle-exclamation"></i>
+            <div>
+              <strong>Payment QR is not available.</strong>
+              <div style="font-size:12px">Please contact Zesto support or try again later.</div>
+            </div>
+          </div>
+        `}
+
+        <div style="margin-top:16px">
+          <div style="font-weight:700;color:#111;font-size:16px">UPI ID</div>
+          <div id="payment-upi-id" style="background:var(--accentLight);border:1px solid var(--line);border-radius:10px;padding:12px;margin-top:6px;font-family:monospace;font-size:16px;color:var(--accentDark);word-break:break-all">
+            ${upiId ? escapeHtml(upiId) : "Not available"}
+          </div>
+          ${upiId ? `
+            <button class="btn btn-outline" id="copy-upi-id" type="button" style="margin-top:8px">
+              <i class="fa-regular fa-copy"></i> Copy UPI ID
+            </button>
+          ` : ``}
+        </div>
+
+        <div class="muted" style="font-size:12px;margin-top:12px">
+          The QR code and UPI ID are provided by Zesto payment settings.
+        </div>
+
+        <div class="sep" style="margin:20px 0"></div>
+
+        <input id="upi-txn-id" placeholder="Enter UPI Transaction/Reference ID" style="margin-top:10px">
+
+        <button class="btn btn-block" id="confirm-online-pay" style="margin-top:10px;background:var(--success)">
+          <i class="fa-solid fa-check"></i> I Have Paid — Confirm
+        </button>
+
+        <div style="margin-top:10px">
+          <button class="btn btn-outline btn-block" onclick="routeTo('#/checkout')">
+            <i class="fa-solid fa-arrow-left"></i> Go Back
+          </button>
+        </div>
+      </div>
+    </section>`;
+
+  const copyBtn=$("#copy-upi-id");
+  if(copyBtn){
+    copyBtn.addEventListener("click",async()=>{
+      try{
+        await navigator.clipboard.writeText(upiId);
+        toast("UPI ID copied!");
+      }catch(e){
+        const ta=document.createElement("textarea");
+        ta.value=upiId;document.body.appendChild(ta);ta.select();
+        document.execCommand("copy");ta.remove();
+        toast("UPI ID copied!");
+      }
+    });
+  }
+
+  const downloadBtn=$("#download-payment-qr");
+  if(downloadBtn){
+    downloadBtn.innerHTML='<i class="fa-solid fa-up-right-from-square"></i> Open / Save QR';
+    downloadBtn.addEventListener("click",()=>{
+      try{
+        const img=$("#payment-qr-image");
+        const src=img?.currentSrc||img?.src||qrImage;
+        if(!src)throw new Error("QR not available");
+
+        // Keep the QR view inside the same app so the on-screen Back button
+        // always returns to the payment page instead of closing/leaving the app.
+        const old=document.getElementById("zesto-qr-fullscreen");
+        if(old)old.remove();
+        const overlay=document.createElement("div");
+        overlay.id="zesto-qr-fullscreen";
+        overlay.style.cssText="position:fixed;inset:0;z-index:20000;background:#fff;display:flex;align-items:center;justify-content:center;padding:76px 22px 34px;overflow:auto";
+        overlay.innerHTML=`
+          <button id="zesto-qr-back" type="button" aria-label="Back" style="position:fixed;top:max(16px,env(safe-area-inset-top));left:16px;width:46px;height:46px;border:0;border-radius:50%;background:#fff;color:#145A32;display:grid;place-items:center;font-size:28px;box-shadow:0 2px 12px rgba(0,0,0,.16);z-index:2;cursor:pointer">&#8592;</button>
+          <div style="width:100%;max-width:460px;display:flex;flex-direction:column;align-items:center;text-align:center">
+            <h1 style="margin:0 0 28px;font-family:Poppins,Inter,sans-serif;color:#145A32;font-size:clamp(28px,7vw,38px);line-height:1.15">Zesto Payment QR</h1>
+            <img src="${escapeHtml(src)}" alt="Payment QR code" style="display:block;width:min(82vw,390px);height:auto;max-height:58vh;object-fit:contain">
+            <p style="margin:22px 0 0;color:#333;font-size:17px;font-weight:600;line-height:1.45">Scan this QR code to make payment.</p>
+          </div>`;
+        document.body.appendChild(overlay);
+        document.getElementById("zesto-qr-back")?.addEventListener("click",()=>overlay.remove());
+      }catch(err){
+        console.error("QR open failed:",err);
+        zAlert("QR image could not be opened. Please try again.");
+      }
+    });
+  }
+
+  $("#confirm-online-pay").addEventListener("click",()=>{
+    const txn=($("#upi-txn-id")?.value||"").trim();
+    if(!txn){zAlert("Enter UPI Transaction ID.");return}
+    const up=readLocal("sf_pending",null);
+    if(!up){zAlert("No pending order.");return}
+    up.upiTxnId=txn;
+    up.paymentMethod="online";
+    up.status="Online Payment - Verifying";
+    writeLocal("sf_pending",up);
+    routeTo("#/cod/review");
+  });
+}
+
+function CODReviewView(){
+  setTopbar("Confirm Order",true);setActiveTab("");
+  const pend=readLocal("sf_pending",null);if(!pend){routeTo("#/cart");return}
+  const items=(pend.items||[]).filter(it=>it && it.productId && String(it.name||"").trim() && Number(it.qty)>0 && Number(it.price)>0);
+  const sub=items.reduce((a,it)=>a+((it.price||0)*it.qty),0);
+  const shipT=safeNumber(pend.orderShipping, items.length?Math.max(...items.map(it=>safeNumber(it.shipping,50))):0);
+  const grand=sub+shipT;
+  const isOnline=pend.paymentMethod==="online";
+  const payLabel=isOnline?"Online Payment (UPI)":"Cash on Delivery";
+  const payBadge=isOnline?`<div class="chip" style="background:#5F259F;color:#fff;border-color:#5F259F"><i class="fa-solid fa-credit-card"></i> ${payLabel}</div>`:`<div class="chip" style="background:var(--accentLight);border-color:var(--accent);color:var(--accentDark)"><i class="fa-solid fa-money-bill-wave"></i> ${payLabel}</div>`;
+  $("#view").innerHTML=`
+    <section style="padding:14px">
+      <div class="card pad">
+        <h3 style="margin:0 0 10px;font-family:Poppins;color:var(--accentDark)">Order Review</h3>
+        ${items.map(it=>`<div class="row" style="padding:8px 0;border-bottom:1px solid var(--line)"><div>${escapeHtml(it.name)} <span class="muted">x${it.qty}</span></div><div style="font-weight:700;color:var(--accentDark)">${money((it.price||0)*it.qty)}</div></div>`).join("")}
+        <div class="row" style="margin-top:10px"><span class="muted">Shipping</span><span>${shipT===0?"Free":money(shipT)}</span></div><div class="row" style="margin-top:6px"><strong>Total</strong><strong style="color:var(--accentDark)">${money(grand)}</strong></div>
+        <div style="margin-top:10px">${payBadge}</div>${isOnline?`<div class="notif-banner warning" style="margin-top:12px"><i class="fa-solid fa-shield-halved"></i><div><strong>Payment verification required.</strong><div style="font-size:12px">A UPI transaction ID alone does not prove payment. Your order will remain pending until verified by Zesto.</div></div></div>`:""}
+      </div>
+      <div class="card pad" style="margin-top:12px">
+        <h3 style="margin:0 0 8px;font-family:Poppins;color:var(--accentDark)">Shipping Details</h3>
+        <div>${escapeHtml(pend.customer.name)}</div>
+        <div class="muted">${escapeHtml(pend.customer.address)} — ${escapeHtml(pend.customer.pincode)}</div>
+        <div class="muted">Phone: ${escapeHtml(pend.customer.phone)}</div>
+      </div>
+      <div style="margin-top:16px"><button class="btn btn-block" id="confirm-cod"><i class="fa-solid fa-check-double"></i> Confirm Your Order</button></div>
+    </section>`;
+  $("#confirm-cod").addEventListener("click",finalizeCOD);
+}
+async function finalizeCOD(){
+  const pend=readLocal("sf_pending",null);
+  if(!pend){zAlert("No pending order.");return}
+  if(!pend.items?.length){zAlert("Your cart is empty.");return}
+  if(await isCustomerBlockedLive(pend.customer?.email,pend.customer?.phone)){
+    showBlockedCustomerMessage();
+    localStorage.removeItem("sf_pending");
+    routeTo("#/cart");
+    return;
+  }
+  // Final server-backed availability check immediately before creating the order.
+  try{
+    const cfgSnap=await appConfigRef.once("value");
+    const liveCfg=cfgSnap.val()||{};
+    if(pend.paymentMethod==="cod" && liveCfg.codEnabled===false){
+      zAlert("Cash on Delivery is currently not available. Please choose Online Payment.");
+      localStorage.removeItem("sf_pending"); routeTo("#/checkout"); return;
+    }
+    if(pend.paymentMethod==="online" && liveCfg.onlinePaymentEnabled===false){
+      zAlert("Online Payment is currently not available. Please choose Cash on Delivery.");
+      localStorage.removeItem("sf_pending"); routeTo("#/checkout"); return;
+    }
+  }catch(err){
+    console.error("Final payment availability check failed:",err);
+    zAlert("Payment availability could not be verified. Please check your internet and try again.");
+    return;
+  }
+  const cleanItems=getValidOrderItems(pend.items);
+  if(!cleanItems.length){
+    zAlert("This order contains no valid product. Please add the product again.");
+    localStorage.removeItem("sf_pending"); routeTo("#/cart"); return;
+  }
+  pend.items=cleanItems;
+  pend.orderShipping=cleanItems.reduce((sum,it)=>sum+Math.max(0,Number(it.shipping)||0),0);
+  pend.amount=cleanItems.reduce((sum,it)=>sum+(Math.max(0,Number(it.price)||0)*Math.max(1,Number(it.qty)||1)),0)+pend.orderShipping;
+  const k=db.ref('orders').push().key;
+  const isOnline=pend.paymentMethod==="online";
+  const data={...pend,firebaseKey:k,createdAt:Date.now(),
+    // Online payments are NEVER treated as paid from a client-entered transaction ID.
+    status:isOnline?"Payment Verification Required":"COD - Placed",
+    paymentStatus:isOnline?"pending":"not_required",
+    trackingUrl:""};
+  db.ref('orders/'+k).set(data).then(()=>{
+    writeLocal("sf_last_order",data);localStorage.removeItem("sf_pending");CART=[];saveCart();routeTo("#/cod/success");
+  }).catch(err=>{console.error(err);zAlert("Failed to place order. Please try again.")});
+}
+function CODSuccessView(){
+  setTopbar("Order Confirmed",true);setActiveTab("");
+  const last=readLocal("sf_last_order",null);
+  $("#view").innerHTML=`<section class="success-wrap"><div class="check-anim"><i class="fa-solid fa-check" style="font-size:36px"></i></div><div class="confetti" id="confetti"></div><h2 style="font-family:Poppins;margin:12px 0 8px;color:var(--accentDark);text-align:center;width:100%">${last?.paymentMethod==='online'?'Order Submitted for Payment Verification':'Order Confirmed!'}</h2><div class="muted" style="text-align:center">Order <b>#${escapeHtml(last?.orderId||"")}</b></div><div style="margin-top:16px;display:flex;gap:10px;flex-direction:column;width:100%;max-width:480px"><a class="btn btn-block" href="#/confirm">Track My Order</a><a class="btn btn-outline btn-block" href="#/shop">Back to Shop</a></div></section>`;
+  popConfetti();playSuccessSoundOnce(last?.orderId||last?.firebaseKey||"order");
+}
+
+
+function getOrderEtaDeadline(o){
+  const explicit=Number(o?.etaDeadline);
+  if(Number.isFinite(explicit) && explicit>0) return explicit;
+  const oldMinutes=Number(o?.deliveryTimer);
+  const created=Number(o?.createdAt);
+  if(Number.isFinite(oldMinutes) && oldMinutes>0 && Number.isFinite(created) && created>0){
+    return created + oldMinutes*60*1000;
+  }
+  return 0;
+}
+function formatDeliveryCountdown(ms){
+  if(ms<=0) return "ETA reached";
+  const totalSeconds=Math.floor(ms/1000);
+  const days=Math.floor(totalSeconds/86400);
+  const hours=Math.floor((totalSeconds%86400)/3600);
+  const minutes=Math.floor((totalSeconds%3600)/60);
+  const seconds=totalSeconds%60;
+  return `${days}d ${String(hours).padStart(2,'0')}h ${String(minutes).padStart(2,'0')}m ${String(seconds).padStart(2,'0')}s`;
+}
+
+function ConfirmView(){
+  setTopbar("Live Order Tracking",true);setActiveTab("");
+  
+  // Refresh live order data from DB if available
+  const lastLocal = readLocal("sf_last_order",null);
+  let orderData = lastLocal;
+  
+  // If the order exists in our synced ORDERS array, use the live data so timer updates dynamically
+  if (lastLocal && lastLocal.orderId) {
+      const liveData = ORDERS.find(o => o.orderId === lastLocal.orderId);
+      if (liveData) orderData = liveData;
+  }
+
+  // BUG FIX: Stop execution if orderData is missing, otherwise it crashes the page and loader hangs
+  if (!orderData) {
+      routeTo("#/shop");
+      return;
+  }
+
+  const items=getValidOrderItems(orderData.items);
+  const grand=items.reduce((a,it)=>a+((it.price||0)*it.qty),0)+safeNumber(orderData.orderShipping,items.length?Math.max(...items.map(it=>safeNumber(it.shipping,50))):0);
+  
+  const isDelivered = String(orderData.status||'').toLowerCase().includes('delivered');
+  const isCancelled = orderData.status && orderData.status.includes('Cancelled');
+  let timerHtml = '';
+  
+  // Order Timer Logic - specifically placed in Confirmation/Tracking Page
+  if (!isDelivered && !isCancelled && orderData) {
+      timerHtml = `<div class="card pad" style="margin-bottom:12px; text-align:center; background:#FFF8E1; border-color:#FFE082;">
+          <h4 style="margin:0; color:#F57C00; font-family:Poppins;"><i class="fa-solid fa-stopwatch"></i> Estimated Delivery</h4>
+          <div id="order-timer" style="font-size:28px; font-weight:bold; color:#E65100; margin-top:8px;">--</div>
+          <div style="font-size:12px; color:#F57C00; margin-top:4px;">Live delivery countdown</div>
+      </div>`;
+      
+      setTimeout(() => {
+          const timerEl = document.getElementById(`order-timer`);
+          if(!timerEl) return;
+          const currentTimer = orderData.deliveryTimer || 30; // Default 30 or Admin edited
+          const targetTime = orderData.createdAt + currentTimer * 60 * 1000;
+          
+          const updateTimer = () => {
+              if(!document.getElementById(`order-timer`)) return clearInterval(intv);
+              const now = Date.now();
+              const diff = targetTime - now;
+              if(diff <= 0) {
+                  timerEl.textContent = "Almost there!";
+                  clearInterval(intv);
+              } else {
+                  const m = Math.floor(diff / 60000);
+                  const s = Math.floor((diff % 60000) / 1000);
+                  timerEl.textContent = `${m.toString().padStart(2,'0')}:${s.toString().padStart(2,'0')} Min`;
+              }
+          };
+          let intv = null;
+          updateTimer();
+          intv = setInterval(updateTimer, 1000);
+      }, 100);
+  }
+
+  $("#view").innerHTML=`<section style="padding:14px">
+    ${timerHtml}
+    <div class="card pad" style="text-align:center"><div class="check-anim"><i class="fa-solid fa-check" style="font-size:36px"></i></div><h2 style="margin:6px 0;font-family:Poppins;color:var(--accentDark)">Thank you!</h2><div class="muted">Order <b>#${escapeHtml(orderData.orderId||"")}</b></div><div class="chip" style="margin-top:8px;background:var(--accentLight);color:var(--accentDark)">${escapeHtml(orderData.status||'Placed')}</div></div>
+    <div class="card pad" style="margin-top:12px">
+      <h3 style="margin:0 0 10px;font-family:Poppins;color:var(--accentDark)">Order Progress</h3>
+      <div class="small"><b>Status:</b> ${escapeHtml(orderData.status||"Placed")}</div>
+      <div class="small" style="margin-top:6px"><b>Payment:</b> ${orderData.paymentMethod==="online"?"Online / UPI":"Cash on Delivery"} · ${orderData.paymentStatus==="paid"?"Confirmed":orderData.paymentStatus==="processing"?"Processing":orderData.paymentStatus==="pending"?"Verification Pending":orderData.paymentStatus==="not_required"?"COD":"Pending"}</div>
+    </div>
+    <div class="card pad" style="margin-top:12px"><h3 style="margin:0 0 10px;font-family:Poppins;color:var(--accentDark)">Order Summary</h3>${items.map(it=>{const img=PRODUCTS.find(x=>x.id===it.productId)?.imageUrls?.[0]||"";return`<div style="display:flex;gap:10px;align-items:center;padding:8px 0;border-bottom:1px solid var(--line)"><img src="${safeUrl(img)}" style="width:48px;height:48px;object-fit:cover;border-radius:10px"><div style="flex:1"><div style="font-weight:700">${escapeHtml(it.name)}</div><div class="muted" style="font-size:13px">Qty ${it.qty}</div></div><div style="font-weight:700;color:var(--accentDark)">${money((it.price||0)*it.qty)}</div></div>`}).join("")}
+      <div class="row" style="margin-top:10px"><div style="font-weight:700">Total</div><div style="font-weight:700;color:var(--accentDark)">${money(grand)}</div></div></div>
+    <div style="margin:16px 0;display:flex;flex-direction:column;gap:10px"><a class="btn btn-outline btn-block" href="#/shop">Back to Shop</a></div></section>`;
+}
+
+function ContactSupportView(){
+  setTopbar("Contact Support",true);setActiveTab("");
+  $("#view").innerHTML=`
+    <section style="padding:14px">
+      <div style="text-align:center;margin-bottom:20px"><div style="width:72px;height:72px;border-radius:999px;background:var(--accentLight);display:grid;place-items:center;margin:0 auto 10px"><i class="fa-solid fa-headset" style="font-size:32px;color:var(--accent)"></i></div><h2 style="margin:0 0 6px;font-family:Poppins;color:var(--accentDark)">Need Help?</h2><p class="muted">We're here to assist you</p></div>
+      <a class="contact-card" href="mailto:officialzestocompany@gmail.com"><div class="contact-icon email-icon"><i class="fa-solid fa-envelope"></i></div><div><div style="font-weight:700">Email Us</div><div class="muted" style="font-size:13px">officialzestocompany@gmail.com</div></div></a>
+      <a class="contact-card" href="tel:+919634258114"><div class="contact-icon phone-icon"><i class="fa-solid fa-phone"></i></div><div><div style="font-weight:700">Call Us</div><div class="muted" style="font-size:13px">+91 96342 58114</div></div></a>
+      <div class="contact-card" style="opacity:.6;cursor:default"><div class="contact-icon whatsapp-icon"><i class="fa-brands fa-whatsapp"></i></div><div><div style="font-weight:700">WhatsApp</div><div class="muted" style="font-size:13px">Coming Soon</div></div></div>
+    </section>`;
+}
+
+function AccountView(){
+  setTopbar("My Account",false);setActiveTab("account");
+  $("#view").innerHTML=`
+    <section style="padding:14px">
+      ${blockedCustomerMatch(PROFILE.email,PROFILE.phone)?`<div class="notif-banner warning"><i class="fa-solid fa-ban"></i><div><strong>Ordering Disabled</strong><div style="font-size:12px">This account is blocked by Zesto Admin. You can browse the app, but new orders cannot be placed with this email or phone number.</div></div></div>`:''}<div class="card pad"><div style="display:flex;align-items:center;gap:12px"><div class="avatar"><img src="${safeUrl(PROFILE.avatar,'https://i.pravatar.cc/200?u=sf')}" alt="avatar"></div><div><div style="font-weight:700;font-size:18px;color:var(--accentDark)">${escapeHtml(PROFILE.name||'Guest')}</div><div class="muted">${escapeHtml(PROFILE.email||'')}</div><div class="chip" style="font-size:10px; padding:2px 8px; margin-top:4px;">${escapeHtml(USER_CITY||'City Not Selected')}</div></div></div></div>
+      <div class="card pad" style="margin-top:12px">
+        <a href="#/profile" class="row" style="padding:10px 0"><div><i class="fa-regular fa-user" style="color:var(--accent)"></i> Edit Profile</div><i class="fa-solid fa-chevron-right"></i></a><div class="sep"></div>
+        <a href="#/account/orders" class="row" style="padding:10px 0"><div><i class="fa-regular fa-clipboard" style="color:var(--accent)"></i> Order History</div><i class="fa-solid fa-chevron-right"></i></a><div class="sep"></div>
+        <a href="#/favorites" class="row" style="padding:10px 0"><div><i class="fa-regular fa-heart" style="color:var(--accent)"></i> My Favorites</div><i class="fa-solid fa-chevron-right"></i></a><div class="sep"></div>
+        <div class="row" style="padding:10px 0; cursor:pointer;" onclick="showCityModal()"><div><i class="fa-solid fa-location-dot" style="color:var(--accent)"></i> Change City</div><i class="fa-solid fa-chevron-right"></i></div><div class="sep"></div>
+        <div class="sep"></div>
+        <a href="#/contact-support" class="row" style="padding:10px 0"><div><i class="fa-solid fa-headset" style="color:var(--accent)"></i> Contact Support</div><i class="fa-solid fa-chevron-right"></i></a><div class="sep"></div>
+        <div class="row" id="customer-logout" style="padding:10px 0;cursor:pointer;color:#d9344a"><div><i class="fa-solid fa-right-from-bracket"></i> Logout</div><i class="fa-solid fa-chevron-right"></i></div>
+      </div>
+    </section>`;
+  $("#customer-logout")?.addEventListener("click",async()=>{
+    if(!await zConfirm("Logout from this customer account?"))return;
+    const favorites=PROFILE.favorites||[];
+    PROFILE={name:"",email:"",phone:"",address:"",pincode:"",city:"",state:"",district:"",landmark:"",avatar:"",isComplete:false,favorites};
+    saveProfile();
+    localStorage.removeItem("sf_pending");
+    localStorage.removeItem("sf_next");
+    CURRENT_CUSTOMER_BLOCKED=false;
+    toast("Logged out");
+    updateTabbar();
+    routeTo("#/profile/setup");
+  });
+}
+function ProfileEditView(isSetup=false){
+  setTopbar("Account",true);setActiveTab("");
+  $("#view").innerHTML=`<section style="padding:14px"><div class="profile-head"><div class="avatar"><img id="avatar-img" src="${PROFILE.avatar||'https://i.pravatar.cc/200?u=sf'}" alt="avatar"></div><label class="chip" style="cursor:pointer"><i class="fa-solid fa-camera" style="color:var(--accent)"></i> Change Photo<input type="file" id="avatar-file" accept="image/*" style="display:none"></label></div>
+    <div class="card pad"><h3 style="margin:0 0 12px;font-family:Poppins;color:var(--accentDark)">Profile Information</h3>
+      <label>Name</label><input id="pfv-name" value="${escapeHtml(PROFILE.name||'')}">
+      <label>Email</label><input id="pfv-email" type="email" value="${escapeHtml(PROFILE.email||'')}">
+      <label>Phone</label><input id="pfv-phone" type="tel" value="${escapeHtml(PROFILE.phone||'')}">
+      <div class="row" style="gap:10px;margin-top:10px"><div style="flex:1"><label>Pincode</label><input id="pfv-pincode" value="${escapeHtml(PROFILE.pincode||'')}"></div><div style="flex:1"><label>City</label><input id="pfv-city" value="${escapeHtml(PROFILE.city||USER_CITY||'')}"></div></div>
+      <div class="row" style="gap:10px;margin-top:10px"><div style="flex:1"><label>State</label><input id="pfv-state" value="${escapeHtml(PROFILE.state||'')}"></div><div style="flex:1"><label>District</label><input id="pfv-district" value="${escapeHtml(PROFILE.district||'')}"></div></div>
+      <label style="margin-top:10px">Landmark</label><input id="pfv-landmark" value="${escapeHtml(PROFILE.landmark||'')}">
+      <label style="margin-top:10px">Address</label><input id="pfv-address" value="${escapeHtml(PROFILE.address||'')}">
+      <div style="margin-top:14px"><button class="btn btn-block" id="pfv-save">${isSetup?'Save & Continue':'Save Changes'}</button></div>
+    </div></section>`;
+  $("#avatar-file").addEventListener("change",async e=>{const f=e.target.files?.[0];if(!f)return;const url=await compressToDataURL(f,400,400,.9);PROFILE.avatar=url;saveProfile();$("#avatar-img").src=url});
+  $("#pfv-save").addEventListener("click",()=>{
+    const profileEmail=$("#pfv-email").value.trim(), profilePhone=$("#pfv-phone").value.trim();
+    if(blockedCustomerMatch(profileEmail,profilePhone)){showBlockedCustomerMessage();return}
+    PROFILE.name=$("#pfv-name").value.trim();PROFILE.email=profileEmail;PROFILE.phone=profilePhone;PROFILE.pincode=$("#pfv-pincode").value.trim();PROFILE.city=$("#pfv-city").value.trim();PROFILE.state=$("#pfv-state").value.trim();PROFILE.district=$("#pfv-district").value.trim();PROFILE.landmark=$("#pfv-landmark").value.trim();PROFILE.address=$("#pfv-address").value.trim();PROFILE.isComplete=hasCompleteProfile();saveProfile();const next=readLocal("sf_next",null);localStorage.removeItem("sf_next");toast("Profile saved");if(isSetup&&next)routeTo(next);else{updateTabbar();routeTo("#/account")}
+  });
+}
+function FavoritesView(){
+  setTopbar("My Favorites",true);setActiveTab("");
+  const favs=PRODUCTS.filter(p=>PROFILE.favorites.includes(p.id));
+  $("#view").innerHTML=`<section style="padding:14px">${favs.length===0?`<div class="card pad" style="text-align:center;padding:26px"><div style="font-size:48px;color:var(--accent);margin-bottom:12px"><i class="fa-regular fa-heart"></i></div><div class="muted">No favorites yet.</div><div style="margin-top:10px"><a class="btn btn-outline" href="#/shop">Browse</a></div></div>`:`<div class="grid" id="fav-grid">${favs.map(p=>ProductCard(p)).join("")}</div>`}</section>`;
+  if(favs.length>0)attachProductCardHandlers($("#fav-grid"));
+}
+
+let ORDER_DETAIL_TIMER_INTERVAL=null;
+
+function getCustomerOrderStatus(o){
+  const status=String(o?.status||'Order Placed');
+  const low=status.toLowerCase();
+  if(low.includes('cancel')) return {label:'Order Cancelled',icon:'fa-circle-xmark',tone:'danger'};
+  if(low.includes('delivered')) return {label:'Delivered',icon:'fa-circle-check',tone:'success'};
+  if(o?.paymentMethod==='online' && o?.paymentStatus!=='paid' && !low.includes('confirmed')) return {label:'Payment Verification Required',icon:'fa-shield-halved',tone:'waiting'};
+  return {label:status,icon:'fa-receipt',tone:'active'};
+}
+
+function buildCustomerTrackingSteps(o){
+  const status=String(o?.status||'Order Placed');
+  const cancelled=status.toLowerCase().includes('cancel');
+  const delivered=status.toLowerCase().includes('delivered');
+  const steps=[
+    {label:'Order Placed',sub:'Your order has been sent directly to Zesto Admin.',icon:'fa-receipt',done:true},
+    {label:'Admin Update',sub:cancelled?'Order cancelled by Admin.':delivered?'Order completed by Admin.':`Current status: ${status}`,icon:'fa-shield-halved',done:cancelled||delivered}
+  ];
+  return {steps,currentIndex:cancelled||delivered?1:1,cancelled};
+}
+
+function renderCustomerOrderTracker(o){
+  const {steps,currentIndex,cancelled}=buildCustomerTrackingSteps(o);
+  const current=getCustomerOrderStatus(o);
+
+  if(cancelled){
+    return `<div class="card pad" style="margin-bottom:12px;border-color:#fecaca;background:#fff1f2">
+      <div style="display:flex;align-items:center;gap:10px;color:#be123c;font-weight:800">
+        <i class="fa-solid fa-circle-xmark" style="font-size:22px"></i>
+        <span>Order Cancelled</span>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:6px">This order has been cancelled.</div>
+    </div>`;
+  }
+
+  const rows=steps.map((s,i)=>{
+    const isDone=s.done;
+    const isCurrent=i===currentIndex && !isDone;
+    const isLast=i===steps.length-1;
+    return `<div style="display:grid;grid-template-columns:44px 1fr;gap:10px;position:relative">
+      <div style="display:flex;flex-direction:column;align-items:center;min-height:${isLast?'54px':'78px'}">
+        <div class="${isCurrent?'zesto-track-pulse':''}" style="width:36px;height:36px;border-radius:50%;display:grid;place-items:center;z-index:2;
+          background:${isDone?'var(--accent)':'#fff'};
+          color:${isDone?'#fff':isCurrent?'var(--accent)':'#9CA3AF'};
+          border:2px solid ${isDone||isCurrent?'var(--accent)':'#D1D5DB'}">
+          <i class="fa-solid ${s.icon}"></i>
+        </div>
+        ${!isLast?`<div style="width:4px;flex:1;min-height:38px;border-radius:999px;margin:3px 0;
+          background:${isDone?'var(--accent)':'#E5E7EB'};overflow:hidden;position:relative">
+          ${isCurrent?`<div class="zesto-track-flow" style="position:absolute;left:0;right:0;height:45%;background:var(--accent);border-radius:999px"></div>`:''}
+        </div>`:''}
+      </div>
+      <div style="padding:4px 0 18px">
+        <div style="font-weight:800;color:${isDone||isCurrent?'var(--accentDark)':'#6B7280'}">${escapeHtml(s.label)}</div>
+        <div class="muted" style="font-size:12px;margin-top:3px">${escapeHtml(s.sub)}</div>
+        ${isCurrent?`<div style="display:inline-flex;align-items:center;gap:6px;margin-top:7px;padding:5px 9px;border-radius:999px;background:var(--accentLight);color:var(--accentDark);font-size:11px;font-weight:700">
+          <span class="zesto-live-dot"></span> LIVE
+        </div>`:''}
+      </div>
+    </div>`;
+  }).join('');
+
+  return `<div class="card pad" style="margin-bottom:12px">
+    <div class="row" style="align-items:center;margin-bottom:14px">
+      <div>
+        <h3 style="margin:0;font-family:Poppins;color:var(--accentDark)">Live Order Status</h3>
+        <div class="muted" style="font-size:12px">Updates automatically when Admin changes the order status.</div>
+      </div>
+      <div class="chip" style="background:var(--accentLight);border-color:var(--accent);color:var(--accentDark)">
+        <i class="fa-solid ${current.icon}"></i> ${escapeHtml(current.label)}
+      </div>
+    </div>
+    ${rows}
+  </div>`;
+}
+
+function startOrderDetailTimer(o){
+  if(ORDER_DETAIL_TIMER_INTERVAL){
+    clearInterval(ORDER_DETAIL_TIMER_INTERVAL);
+    ORDER_DETAIL_TIMER_INTERVAL=null;
+  }
+
+  const el=document.getElementById(`order-live-timer-${o.orderId}`);
+  if(!el)return;
+
+  const delivered=String(o.status||'').toLowerCase().includes('delivered');
+  const cancelled=String(o.status||'').toLowerCase().includes('cancel');
+  if(delivered){el.textContent='Delivered';return}
+  if(cancelled){el.textContent='Cancelled';return}
+
+  let label='Estimated delivery';
+  const target=getOrderEtaDeadline(o);
+
+  const labelEl=document.getElementById(`order-live-timer-label-${o.orderId}`);
+  if(labelEl)labelEl.textContent=label;
+
+  const tick=()=>{
+    const live=document.getElementById(`order-live-timer-${o.orderId}`);
+    if(!live){
+      clearInterval(ORDER_DETAIL_TIMER_INTERVAL);
+      ORDER_DETAIL_TIMER_INTERVAL=null;
+      return;
+    }
+    if(!target){
+      live.textContent='ETA not set';
+      clearInterval(ORDER_DETAIL_TIMER_INTERVAL);
+      ORDER_DETAIL_TIMER_INTERVAL=null;
+      return;
+    }
+    const diff=target-Date.now();
+    live.textContent=formatDeliveryCountdown(diff);
+    if(diff<=0){
+      clearInterval(ORDER_DETAIL_TIMER_INTERVAL);
+      ORDER_DETAIL_TIMER_INTERVAL=null;
+    }
+  };
+  tick();
+  ORDER_DETAIL_TIMER_INTERVAL=setInterval(tick,1000);
+}
+
+function OrdersListView(){
+  setTopbar("Order History",true);setActiveTab("");
+  const rows=[...ORDERS].filter(o=>o.customer&&String(o.customer.email||'').toLowerCase()===String(PROFILE.email||'').toLowerCase()).sort((a,b)=>(Number(b.createdAt)||0)-(Number(a.createdAt)||0));
+  $("#view").innerHTML=`<section style="padding:14px">${rows.length===0?`<div class="card pad" style="text-align:center"><div style="font-size:48px;color:var(--accent);margin-bottom:12px"><i class="fa-regular fa-clipboard"></i></div><div class="muted">No orders yet.</div></div>`:rows.map(o=>{
+    return`<a class="card pad" style="display:block;margin-bottom:12px" href="#/account/orders/${o.orderId}"><div class="row"><strong style="color:var(--accentDark)">#${escapeHtml(o.orderId)}</strong><span class="muted">${new Date(o.createdAt).toLocaleString()}</span></div><div class="row" style="margin-top:6px"><div class="muted">${escapeHtml(getValidOrderItems(o.items).map(i=>i.name+" x"+i.qty).join(", ")||"No valid items")}</div><div><strong style="color:var(--accentDark)">${money(o.amount)}</strong></div></div><div class="chip" style="margin-top:8px;background:var(--accentLight);border-color:var(--accent);color:var(--accentDark)"><i class="fa-solid ${getCustomerOrderStatus(o).icon}"></i> ${escapeHtml(getCustomerOrderStatus(o).label)}</div></a>`}).join("")}</section>`;
+}
+
+function OrderDetailView(orderId){
+  const normalizedOrderId=String(orderId||'');
+  const currentEmail=String(PROFILE.email||'').trim().toLowerCase();
+  const o=ORDERS.find(x=>String(x.orderId||'')===normalizedOrderId &&
+    String(x.customer?.email||'').trim().toLowerCase()===currentEmail);
+
+  if(!o){OrdersListView();return}
+  setTopbar("Track My Order",true);setActiveTab("");
+
+  const items=getValidOrderItems(o.items);
+  const paymentLabel=o.paymentMethod==='online'
+    ? (o.paymentStatus==='paid'?'Online / UPI — Confirmed':o.paymentStatus==='processing'?'Online / UPI — Processing':'Online / UPI — Verification Required')
+    : 'Cash on Delivery';
+
+  const isDelivered=String(o.status||'').toLowerCase().includes('delivered');
+  const isCancelled=String(o.status||'').toLowerCase().includes('cancel');
+
+  const timerHtml=!isDelivered&&!isCancelled?`
+    <div class="card pad" style="margin-bottom:12px;text-align:center;background:#FFF8E1;border-color:#FFE082">
+      <div id="order-live-timer-label-${o.orderId}" style="font-size:12px;font-weight:700;color:#F57C00">Estimated arrival</div>
+      <div id="order-live-timer-${o.orderId}" style="font-size:28px;font-weight:900;color:#E65100;margin-top:4px">--</div>
+      <div class="muted" style="font-size:11px;margin-top:4px">Days automatically decrease every 24 hours. Refreshing the app does not reset it.</div>
+    </div>`:'';
+
+  $("#view").innerHTML=`<section style="padding:14px">
+    ${timerHtml}
+    ${renderCustomerOrderTracker(o)}
+
+    <div class="card pad" style="margin-bottom:12px">
+      <div class="row" style="align-items:flex-start">
+        <div>
+          <div class="muted" style="font-size:11px">ORDER ID</div>
+          <strong style="color:var(--accentDark)">#${escapeHtml(o.orderId)}</strong>
+        </div>
+        <div class="muted" style="font-size:12px;text-align:right">${new Date(o.createdAt).toLocaleString()}</div>
+      </div>
+
+      <div class="sep"></div>
+
+      ${items.map(it=>`<div class="row" style="padding:7px 0">
+        <div>${escapeHtml(it.name||'Item')} <span class="muted">x${Number(it.qty)||1}</span></div>
+        <div style="font-weight:700;color:var(--accentDark)">${money((Number(it.price)||0)*(Number(it.qty)||1))}</div>
+      </div>`).join('')}
+
+      <div class="sep"></div>
+      <div class="row"><strong>Total</strong><strong style="color:var(--accentDark)">${money(o.amount||0)}</strong></div>
+    </div>
+
+    <div class="card pad" style="margin-bottom:12px">
+      <div class="row" style="align-items:center">
+        <div>
+          <div style="font-weight:800">Payment</div>
+          <div class="muted" style="font-size:12px">${o.paymentMethod==='online'?'Online payment status':'Pay when the order arrives'}</div>
+        </div>
+        <div class="chip" style="background:${o.paymentStatus==='paid'?'#DCFCE7':'var(--accentLight)'};color:${o.paymentStatus==='paid'?'#166534':'var(--accentDark)'};border-color:${o.paymentStatus==='paid'?'#86EFAC':'var(--accent)'}">
+          <i class="fa-solid ${o.paymentStatus==='paid'?'fa-circle-check':'fa-shield-halved'}"></i>
+          ${escapeHtml(paymentLabel)}
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:12px">
+      <a class="btn btn-outline btn-block" href="#/account/orders"><i class="fa-solid fa-arrow-left"></i> Back to Order History</a>
+    </div>
+  </section>`;
+
+  setTimeout(()=>startOrderDetailTimer(o),0);
+}
+
+async function compressToDataURL(file,maxW=1200,maxH=1200,quality=.85){const img=await fileToImage(file);const[w,h]=fitRect(img.naturalWidth,img.naturalHeight,maxW,maxH);const c=document.createElement("canvas");c.width=w;c.height=h;c.getContext("2d").drawImage(img,0,0,w,h);return c.toDataURL("image/jpeg",quality)}
+function fitRect(w,h,mW,mH){const r=Math.min(mW/w,mH/h,1);return[Math.round(w*r),Math.round(h*r)]}
+function fileToImage(file){return new Promise((res,rej)=>{const fr=new FileReader();fr.onload=()=>{const img=new Image();img.onload=()=>res(img);img.onerror=rej;img.src=fr.result};fr.onerror=rej;fr.readAsDataURL(file)})}
+function popConfetti(){const c=$("#confetti");if(!c)return;c.innerHTML="";const colors=["#7cbf5c","#5a9a3e","#a3d98a","#4a8a30","#8ed070"];for(let i=0;i<24;i++){const s=document.createElement("span");s.style.left=(4+Math.random()*92)+"%";s.style.background=colors[Math.floor(Math.random()*colors.length)];s.style.animationDelay=(Math.random()*.6)+"s";c.appendChild(s)}}
+function playSuccessSound(){try{const ctx=new(window.AudioContext||window.webkitAudioContext)();const o=ctx.createOscillator(),g=ctx.createGain();o.type="triangle";o.frequency.setValueAtTime(660,ctx.currentTime);g.gain.setValueAtTime(.001,ctx.currentTime);g.gain.exponentialRampToValueAtTime(.3,ctx.currentTime+.02);g.gain.exponentialRampToValueAtTime(.001,ctx.currentTime+.4);o.connect(g).connect(ctx.destination);o.start();o.stop(ctx.currentTime+.42);setTimeout(()=>ctx.close(),600)}catch(e){}}
+let lastSuccessSoundOrder="";
+function playSuccessSoundOnce(orderKey){
+  const key=String(orderKey||"order");
+  if(lastSuccessSoundOrder===key)return;
+  lastSuccessSoundOrder=key;
+  playSuccessSound();
+}
+
+const chatbotToggle=$("#chatbot-toggle"),chatbotPopup=$("#chatbot-popup"),chatbotClose=$("#chatbot-close"),chatbotBody=$("#chatbot-body"),chatbotQuestions=$("#chatbot-questions");
+const FAQ_DATA=[{q:"How can I place an order?",a:"Browse our menu, add items to cart, and checkout."},{q:"What are your payment options?",a:"We accept Cash on Delivery and Online Payment via UPI."},{q:"How to contact support?",a:"Email us at sahpaufoodstore@gmail.com or call us at +91 96342 58114."}];
+function renderChatbotQ(){chatbotQuestions.innerHTML=FAQ_DATA.map((f,i)=>`<button class="question-chip" data-qi="${i}">${escapeHtml(f.q)}</button>`).join('');$$('.question-chip').forEach(b=>b.addEventListener('click',handleQClick))}
+function handleQClick(e){const b=e.target.closest('.question-chip');if(!b)return;const i=parseInt(b.dataset.qi);addMsg(FAQ_DATA[i].q,true);chatbotQuestions.innerHTML='';const t=addMsg('Typing...',false,'typing');setTimeout(()=>{if(t)t.remove();addMsg(FAQ_DATA[i].a,false)},1200)}
+function addMsg(text,isUser=false,cls=''){const c=document.createElement('div');c.className=`chatbot-msg-container ${isUser?'user-msg':'bot-msg'}`;const m=document.createElement('div');m.className=`chatbot-msg ${!isUser?'bot':''} ${cls}`;m.textContent=text;c.appendChild(m);chatbotBody.appendChild(c);chatbotBody.scrollTop=chatbotBody.scrollHeight;return cls==='typing'?m:null}
+chatbotToggle.addEventListener('click',()=>{chatbotPopup.classList.toggle('visible');if(chatbotPopup.classList.contains('visible')){chatbotBody.innerHTML='';addMsg("Hello! I'm Zesto AI. Select a question:",false);renderChatbotQ()}});
+chatbotClose.addEventListener('click',()=>{chatbotPopup.classList.remove('visible');chatbotBody.innerHTML=''});
+
+function render(){
+  const{parts}=parseRoute();
+  if(!dataFetched.products||!dataFetched.orders||!dataFetched.ratings||!dataFetched.config){showLoader();return}
+  updateTabbar();
+  const[r,id,sub]=parts;
+  if(!r||r==="shop")ShopView();
+  else if(r==="home")HomeView();
+  else if(r==="product"&&id)ProductView(id);
+  else if(r==="cart")CartView();
+  else if(r==="checkout")CheckoutView();
+  else if(r==="pay"&&id==="online")OnlinePayView();
+  else if(r==="cod"&&id==="review")CODReviewView();
+  else if(r==="cod"&&id==="success")CODSuccessView();
+  else if(r==="confirm")ConfirmView();
+  else if(r==="account"&&id==="orders"&&sub)OrderDetailView(sub);
+  else if(r==="account"&&id==="orders")OrdersListView();
+  else if(r==="favorites")FavoritesView();
+  else if(r==="account")AccountView();
+  else if(r==="profile"&&id==="setup")ProfileEditView(true);
+  else if(r==="profile")ProfileEditView(false);
+  else if(r==="contact-support")ContactSupportView();
+  else ShopView();
+}
+
+// Initializing the app - Loader starts immediately to prevent blank screen
+(function init(){
+  showLoader();
+  checkCitySelection();
+  checkAndRender();
+  setTimeout(()=>{
+    const splash=document.getElementById("zesto-splash");
+    if(splash) splash.classList.add("hide");
+  },1500);
+})();
+</script>
+<script>
+// Frontend security note: Firebase Realtime Database rules MUST enforce authenticated, owner/role-based writes.
+// This client deliberately never marks UPI payments as paid; a trusted backend/admin must verify paymentStatus.
+</script>
+
+<div id="zesto-min-order-overlay" aria-hidden="true">
+  <div id="zesto-min-order-modal" role="dialog" aria-modal="true" aria-labelledby="zesto-min-order-title">
+    <div class="zesto-min-order-icon"><i class="fa-solid fa-cart-shopping"></i></div>
+    <h3 class="zesto-min-order-title" id="zesto-min-order-title">Minimum Order Requirement</h3>
+    <div class="zesto-min-order-text">Please complete the minimum order requirements before placing your order.</div>
+    <div id="zesto-min-order-rules"></div>
+    <button class="btn btn-block" id="zesto-min-order-close" type="button" style="margin-top:18px">
+      <i class="fa-solid fa-check"></i> Got it
+    </button>
+  </div>
+</div>
+
+</body>
+</html>
